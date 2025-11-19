@@ -1,0 +1,30 @@
+Sub ConvertCSVtoXLSX()
+    Dim csvFolder As String
+    Dim xlsxFolder As String
+    Dim fso As Object
+    Dim fn As String
+    Dim wb As Workbook
+    
+    ' ? point this at your CSV folder:
+    csvFolder = "C:\Users\WerlandL\FRET3"
+    xlsxFolder = csvFolder & "\XLSX"
+    
+    ' Create output folder if needed
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(xlsxFolder) Then fso.CreateFolder xlsxFolder
+    
+    fn = Dir(csvFolder & "\*.csv")
+    Do While fn <> ""
+        ' Open the CSV
+        Set wb = Workbooks.Open(csvFolder & "\" & fn)
+        ' Save as XLSX in the XLSX subfolder
+        wb.SaveAs Filename:=xlsxFolder & "\" & _
+            Left(fn, Len(fn) - 4) & ".xlsx", _
+            FileFormat:=xlOpenXMLWorkbook
+        wb.Close SaveChanges:=False
+        fn = Dir()
+    Loop
+    
+    MsgBox "Conversion complete: CSV ? XLSX done.", vbInformation
+End Sub
+

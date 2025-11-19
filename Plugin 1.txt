@@ -1,0 +1,86 @@
+// =======================================================
+// Integrated Macro: Registration then Crop then Save
+// =======================================================
+
+// Parameter: starting index for image sequence loading.
+startIndex = 5;
+
+// Loop over measurements (for testing, m = 1 to 8; adjust as needed)
+for (m = 1; m <= 4; m++) {
+  
+    // Loop over FOV labels from xy01 to xy20.
+    for (i = 1; i <= 10; i++) {
+      
+        // Close any open images to start clean.
+        run("Close All");
+      
+        // Create the FOV string.
+        if (i < 10) {
+            s = "xy0" + i;
+        } else {
+            s = "xy" + i;
+        }
+        
+        // ---- Registration Step ----
+        // Build the source folder for the current measurement.
+        // (Assume the un-cropped sequences are stored in:
+        //  D:/Bleach FRET raw data/Files/measurement1/, measurement2/, etc.)
+        src = "D:/Bleach FRET raw data/Files/20251114_photobleaching FRET binding affinity/measurement" + m + "/";
+        
+        // Open the image sequence for this FOV using the filter and start index.
+        File.openSequence(src, " filter=" + s + " start=" + startIndex);
+      
+        // Enhance contrast.
+        run("Enhance Contrast", "saturated=0.35");
+      
+        // Run the Linear Stack Alignment with SIFT with your parameters.
+        run("Linear Stack Alignment with SIFT", "initial_gaussian_blur=1.60 steps_per_scale_octave=3 minimum_image_size=64 maximum_image_size=512 feature_descriptor_size=4 feature_descriptor_orientation_bins=8 closest/next_closest_ratio=0.85 maximal_alignment_error=10 inlier_ratio=0.10 expected_transformation=Rigid interpolate show_info show_transformation_matrix");
+      
+        // Wait 500 ms to ensure registration is complete and the aligned stack is active.
+       // wait(500);
+      
+        //alignedTitle = getTitle();
+        //print("Measurement " + m + ", FOV " + s + " aligned. Title: " + alignedTitle);
+      
+      
+      // Wait 4 seconds to ensure registration is complete.
+        wait(4000);
+
+        // Explicitly select the registered window (assumes it is titled "Aligned 54 of 54").
+        selectImage("Aligned 54 of 54");
+        print("Measurement" + m + ", FOV " + s + " aligned. Active window: " + getTitle());
+
+      
+      
+        // ---- Cropping Step ----
+        // Now, working on the registered image sequence, open ROI Manager, load the ROI file,
+        // display all ROIs, select the first ROI, and crop.
+        run("ROI Manager...");
+        roiManager("Open", "Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/ROI.roi");
+        roiManager("Show All");
+        roiManager("Select", 0);
+        run("Crop");
+        run("Enhance Contrast", "saturated=0.35");
+        resetMinAndMax();
+      
+        // ---- Saving Step ----
+        // Build the destination folder for saving.
+        // For example, the destination is:
+        // E:/NewLogic1 1/xy01  for measurement 1, FOV xy01.
+        destParent = "Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/Measurement" + m + "/";
+        File.makeDirectory(destParent);
+        
+        dest = destParent + s;
+        File.makeDirectory(dest);
+        print("Saving to folder: " + dest);
+      
+        // Save the registered and cropped image sequence.
+        run("Image Sequence... ", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name=" + s + "use");
+      
+        // Close all images to prepare for the next iteration.
+        run("Close All");
+    }
+    // Optional: wait 10 seconds after processing each measurement.
+    wait(10000);
+}
+print("All processing completed successfully!");

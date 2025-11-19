@@ -1,0 +1,52 @@
+// -----------------------------------------------------
+// Macro: Copy one file from each FOV subfolder in each Measurement,
+// but save all files into New Folder (9) with a new name:
+// Files from Measurement 1 are prefixed with "Me1", Measurement 2 with "Me2", etc.
+// -----------------------------------------------------
+
+// Loop over Measurement folders (adjust the upper limit as needed)
+for (m = 1; m <= 8; m++) {
+    // Loop over FOV subfolders from xy01 to xy20.
+    for (i = 1; i <= 10; i++) {
+        // Build the FOV label. For numbers less than 10, include a leading zero.
+        if (i < 10) {
+            s = "xy0" + i;
+        } else {
+            s = "xy" + i;
+        }
+        
+        // Construct the original filename.
+        // Example: "ChannelGFP im FusionBF_Seq0001t05xy01c1.tif"
+        filename = s + "use" + "0005.tif";
+        //filename = "xy05" + s + ".tif";
+        
+        // Build the full source path.
+        // Example: "C:/Users/malengoG/Documents/Users/Lisa/New Folder (7)/Measurement 1/xy01/ChannelGFP im FusionBF_Seq0001t05xy01c1.tif"
+        //src = "C:/Users/malengoG/Documents/Users/Lisa/New Folder (4)/Measurement" + m + "/" + s + "/" + filename;
+         src ="Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/Measurement"+ m + "/" + s + "/" + filename;
+        
+        // Destination folder is fixed (no subfolders) in New Folder (9)
+        //destFolder = "Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/input images for cellpose/";
+        destFolder = "Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/input images for cellpose/";
+        // Create the destination folder if it doesn't exist.
+        File.makeDirectory(destFolder);
+        
+        // Construct the new destination filename by prefixing with "Me" plus the measurement number.
+        // Example for measurement 1: "Me1ChannelGFP im FusionBF_Seq0001t05xy01c1.tif"
+        destFilename = "Me" + m + filename;
+        
+        // Build the full destination file path.
+        dest = destFolder + destFilename;
+        
+        print("Copying from: " + src);
+        print("           to: " + dest);
+        
+        // Open the source file.
+        open(src);
+        // Save it as a TIFF file using the new name.
+        saveAs("Tiff", dest);
+        // Close the image.
+        close();
+    }
+}
+print("Processing completed!");

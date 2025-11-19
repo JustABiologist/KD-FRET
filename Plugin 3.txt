@@ -1,0 +1,107 @@
+// =============================================================
+// Integrated Macro for Measurements 1-3, FOVs xy01-xy20
+// with IN (Bleached) and OUT (Unbleached) analysis
+// =============================================================
+
+// Parameter: starting index for image sequence loading.
+startIndex = 5;
+
+// Loop over Measurements (1 to 3)
+for (m = 1; m <= 8; m++) {
+    // Loop over FOV subfolders (xy01 to xy20)
+    for (i = 1; i <= 10; i++) {
+        // Build FOV string (with leading zero if needed)
+        if (i < 10)
+            s = "xy0" + i;
+        else
+            s = "xy" + i;
+        
+        // -------------------------------------------------------------------
+        // IN Analysis (Bleached): Process the "bleached" ROIs
+        // -------------------------------------------------------------------
+        // 1. Open image sequence for this Measurement and FOV.
+        File.openSequence("Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/Measurement" + m + "/" + s + "/");
+        
+        //C:/Users\WerlandL\Measurement1
+        
+        // 2. Open the ROI ZIP file from the Extracted folder.
+        // ROI file naming pattern: Me{m}{s}use0005_rois.zip
+        roiManager("Open", "Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/input images for cellpose/Me" + m + s + "use0005_rois.zip");
+        
+        //Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/input images for cellpose
+        
+        // 3. Open the bleached ROI.
+        roiManager("Open", "Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/Bleached only.roi");
+        
+        // 4. Rename ROIs sequentially.
+        n = roiManager("count");
+        for(j = 0; j < n; j++){
+            roiManager("Select", j);
+            newName = "M" + (j+1);
+            roiManager("rename", newName);
+        }
+        
+        // 5. Get the total number, then select the last ROI and run "Clear Outside".
+        n = roiManager("count");
+        roiManager("Select", n-1);
+        run("Clear Outside", "stack");
+        
+        // 6. Loop backwards over ROIs, measure and delete if mean == 0.
+        n = roiManager("count");
+        for(j = n - 1; j >= 0; j--) {
+            roiManager("select", j);
+            run("Measure");
+            mean = getResult("Mean", nResults - 1);
+            print("IN: Measurement " + m + ", FOV " + s + " - ROI " + j + " → Mean = " + mean);
+            if (mean == 0) {
+                roiManager("delete");
+            }
+            run("Clear Results");
+        }
+        
+        // 7. Deselect, Multi Measure, and save results as CSV (IN)
+        roiManager("Deselect");
+        roiManager("Multi Measure");
+        selectWindow("Results");
+        saveAs("Results", "Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/Analysis Bleaching/Me" + m + s + "ResultsIN-Ble.csv");
+        roiManager("Delete");
+        close();
+        run("Close All");
+        
+        // -------------------------------------------------------------------
+        // OUT Analysis (Unbleached): Process the "unbleached" ROIs
+        // -------------------------------------------------------------------
+        File.openSequence("Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/Measurement" + m + "/" + s + "/");
+        roiManager("Open", "Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/input images for cellpose/Me" + m + s + "use0005_rois.zip");
+        roiManager("Open", "Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/unbleached.roi");
+        n = roiManager("count");
+        for(j = 0; j < n; j++){
+            roiManager("Select", j);
+            newName = "M" + (j+1);
+            roiManager("rename", newName);
+        }
+        n = roiManager("count");
+        roiManager("Select", n-1);
+        run("Clear Outside", "stack");
+        for(j = n - 1; j >= 0; j--) {
+            roiManager("select", j);
+            run("Measure");
+            mean = getResult("Mean", nResults - 1);
+            print("OUT: Measurement " + m + ", FOV " + s + " - ROI " + j + " → Mean = " + mean);
+            if (mean == 0) {
+                roiManager("delete");
+            }
+            run("Clear Results");
+        }
+        
+        roiManager("Deselect");
+        roiManager("Multi Measure");
+        selectWindow("Results");
+        saveAs("Results", "Q:/Members/Lisa Werland/Results/2 Dynamics of regulation of PhoQ by SafA and MgrB/1 Bleach FRET/4 Binding affinity/20251114/Analysis Bleaching/Me" + m + s + "ResultsOUT.csv");
+        roiManager("Delete");
+        close();
+        run("Close All");
+    } // end FOV loop
+} // end Measurement loop
+
+print("All processing completed successfully!");

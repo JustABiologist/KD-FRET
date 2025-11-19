@@ -1,0 +1,1 @@
+cellpose --dir "Q:\Members\Lisa Werland\Results\2 Dynamics of regulation of PhoQ by SafA and MgrB\1 Bleach FRET\4 Binding affinity\20251114\input images for cellpose" --pretrained_model bact_fluor_cp3 --diameter 25 --save_tif --save_png --save_outlines --save_rois --save_txt --verbose
