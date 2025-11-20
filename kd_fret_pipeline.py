@@ -396,9 +396,14 @@ run("Close All");
 src = "{path_for_macro(measurement.source_dir)}";
 File.openSequence(src, "filter={fov} start={config.sequence_start}");
 run("Enhance Contrast", "saturated=0.35");
+print("Loaded stack has " + nSlices + " slices, starting SIFT alignment...");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
 wait(4000);
 selectImage("Aligned 54 of 54");
+if (!isOpen("Aligned 54 of 54")) {
+    print("ERROR: Aligned stack window 'Aligned 54 of 54' not found after SIFT");
+    exit();
+}
 print("Aligned stack active: " + getTitle());
 dest = "{path_for_macro(dest_dir)}";
 run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
@@ -426,7 +431,7 @@ run("Close All");
 src = "{path_for_macro(stack_dir)}";
 File.openSequence(src, "start=1");
 setSlice(nSlices);
-run("Enhance Contrast", "saturated=0.35");
+run("Enhance Contrast", "saturated=0.40");
 run("Brightness/Contrast...");
 waitForUser("Laser ROI", "Draw the bleaching ROI on this aligned stack (Frame " + nSlices + ").\\n\\nAdjust Brightness/Contrast if needed.\\nThen press OK.");
 roiManager("Reset");
@@ -452,9 +457,14 @@ run("Close All");
 src = "{path_for_macro(measurement.source_dir)}";
 File.openSequence(src, "filter={fov} start={config.sequence_start}");
 run("Enhance Contrast", "saturated=0.35");
+print("Loaded stack has " + nSlices + " slices, starting SIFT alignment...");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
 wait(4000);
 selectImage("Aligned 54 of 54");
+if (!isOpen("Aligned 54 of 54")) {
+    print("ERROR: Aligned stack window 'Aligned 54 of 54' not found after SIFT");
+    exit();
+}
 print("Aligned stack active: " + getTitle());
 roiManager("Reset");
 roiManager("Open", "{path_for_macro(config.laser_roi_path)}");
