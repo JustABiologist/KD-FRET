@@ -485,8 +485,10 @@ roiManager("Select", 0);
 run("Crop");
 run("Enhance Contrast", "saturated=0.35");
 resetMinAndMax();
-dest = "{path_for_macro(dest_dir)}";
-run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
+    dest = "{path_for_macro(dest_dir)}";
+    print("Saving cropped sequence to " + dest + "/");
+    run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
+    print("Saved cropped sequence to " + dest + "/");
 run("Close All");
 """
     ij.py.run_macro(macro)
