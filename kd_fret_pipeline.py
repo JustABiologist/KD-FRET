@@ -406,7 +406,10 @@ run("Close All");
 
 
 def prompt_for_laser_roi_from_stack(
-    ij: imagej.ImageJ, stack_dir: Path, config: PipelineConfig
+    ij: imagej.ImageJ,
+    stack_dir: Path,
+    fov: str,
+    config: PipelineConfig,
 ) -> None:
     """
     Open an already aligned stack (mCherry channel) and let the user draw the bleaching ROI.
@@ -415,7 +418,7 @@ def prompt_for_laser_roi_from_stack(
     macro = f"""
 run("Close All");
 src = "{path_for_macro(stack_dir)}";
-File.openSequence(src, "start=1");
+File.openSequence(src, "filter={fov}use start=1");
 setSlice(nSlices);
 run("Enhance Contrast", "saturated=0.35");
 run("Brightness/Contrast...");
@@ -820,7 +823,7 @@ def main() -> None:
             dest_dir=roi_sample_dir,
         )
         try:
-            prompt_for_laser_roi_from_stack(ij, roi_sample_dir, config)
+            prompt_for_laser_roi_from_stack(ij, roi_sample_dir, sample_fov, config)
         finally:
             shutil.rmtree(roi_sample_dir, ignore_errors=True)
     else:
