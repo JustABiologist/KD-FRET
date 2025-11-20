@@ -355,38 +355,71 @@ def collect_measurements(input_root: Path, default_group: str) -> List[Measureme
 # --------------------------------------------------------------------------------------
 
 
+SIFT_PARAMS = (
+    "initial_gaussian_blur=1.60 steps_per_scale_octave=3 "
+    "minimum_image_size=64 maximum_image_size=512 "
+    "feature_descriptor_size=4 feature_descriptor_orientation_bins=8 "
+    "closest/next_closest_ratio=0.85 maximal_alignment_error=10 "
+    "inlier_ratio=0.10 expected_transformation=Rigid interpolate "
+    "show_info"
+)
+
+
 def init_imagej(distribution: Optional[str]) -> imagej.ImageJ:
     logging.info("Starting ImageJ (distribution=%s)...", distribution or "sc.fiji:fiji")
     ij = imagej.init(distribution or "sc.fiji:fiji", headless=False)
     return ij
 
 
-def prompt_for_laser_roi(
+def align_stack_only(
     ij: imagej.ImageJ,
     measurement: Measurement,
-    fov: str,
     config: PipelineConfig,
-) -> None:
+    fov: str,
+    dest_dir: Path,
+) -> Path:
+    """
+    Align a single stack without cropping and persist the registered frames at dest_dir.
+    """
+    if dest_dir.exists():
+        shutil.rmtree(dest_dir)
+    dest_dir = ensure_dir(dest_dir)
     logging.info(
-        "Aligning sample stack (%s %s) for ROI definition...", measurement.name, fov
+        "Preparing ROI sample by aligning %s %s into %s",
+        measurement.name,
+        fov,
+        dest_dir,
     )
-    # Note: We replicate the alignment logic from register_and_crop exactly
-    # but we pause to let the user draw the ROI on the ALIGNED stack.
     macro = f"""
-setBatchMode(true);
 run("Close All");
 src = "{path_for_macro(measurement.source_dir)}";
 File.openSequence(src, "filter={fov} start={config.sequence_start}");
-run("Linear Stack Alignment with SIFT", "initial_gaussian_blur=1.60 steps_per_scale_octave=3 "
-    + "minimum_image_size=64 maximum_image_size=4096 feature_descriptor_size=4 "
-    + "feature_descriptor_orientation_bins=8 closest/next_closest_ratio=0.85 "
-    + "maximal_alignment_error=10 inlier_ratio=0.10 expected_transformation=Rigid "
-    + "interpolate show_info");
+run("Enhance Contrast", "saturated=0.35");
+run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
+wait(3000);
+dest = "{path_for_macro(dest_dir)}";
+run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
+run("Close All");
+"""
+    ij.py.run_macro(macro)
+    return dest_dir
+
+
+def prompt_for_laser_roi_from_stack(
+    ij: imagej.ImageJ, stack_dir: Path, config: PipelineConfig
+) -> None:
+    """
+    Open an already aligned stack (mCherry channel) and let the user draw the bleaching ROI.
+    """
+    logging.info("Opening aligned stack at %s for ROI definition.", stack_dir)
+    macro = f"""
+run("Close All");
+src = "{path_for_macro(stack_dir)}";
+File.openSequence(src, "start=1");
 setSlice(nSlices);
 run("Enhance Contrast", "saturated=0.35");
-setBatchMode("exit and display");
 run("Brightness/Contrast...");
-waitForUser("Laser ROI", "Draw the bleaching ROI on this ALIGNED stack (Frame " + nSlices + ").\\n\\nAdjust Brightness/Contrast if needed.\\nThen press OK.");
+waitForUser("Laser ROI", "Draw the bleaching ROI on this aligned stack (Frame " + nSlices + ").\\n\\nAdjust Brightness/Contrast if needed.\\nThen press OK.");
 roiManager("Reset");
 roiManager("Add");
 roiManager("Select", 0);
@@ -406,16 +439,11 @@ def register_and_crop(
     dest_parent = ensure_dir(config.registered_root / measurement.name)
     dest_dir = ensure_dir(dest_parent / fov)
     macro = f"""
-setBatchMode(true);
 run("Close All");
 src = "{path_for_macro(measurement.source_dir)}";
 File.openSequence(src, "filter={fov} start={config.sequence_start}");
 run("Enhance Contrast", "saturated=0.35");
-run("Linear Stack Alignment with SIFT", "initial_gaussian_blur=1.60 steps_per_scale_octave=3 "
-    + "minimum_image_size=64 maximum_image_size=4096 feature_descriptor_size=4 "
-    + "feature_descriptor_orientation_bins=8 closest/next_closest_ratio=0.85 "
-    + "maximal_alignment_error=10 inlier_ratio=0.10 expected_transformation=Rigid "
-    + "interpolate show_info");
+run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
 wait(3000);
 roiManager("Reset");
 roiManager("Open", "{path_for_macro(config.laser_roi_path)}");
@@ -426,7 +454,6 @@ resetMinAndMax();
 dest = "{path_for_macro(dest_dir)}";
 run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
 run("Close All");
-setBatchMode(false);
 """
     ij.py.run_macro(macro)
     return dest_dir
@@ -784,7 +811,18 @@ def main() -> None:
         # Use the first available measurement/FOV as the sample
         sample_measurement = measurements[0]
         sample_fov = sample_measurement.fovs[0]
-        prompt_for_laser_roi(ij, sample_measurement, sample_fov, config)
+        roi_sample_dir = config.registered_root / "__roi_sample__"
+        align_stack_only(
+            ij=ij,
+            measurement=sample_measurement,
+            config=config,
+            fov=sample_fov,
+            dest_dir=roi_sample_dir,
+        )
+        try:
+            prompt_for_laser_roi_from_stack(ij, roi_sample_dir, config)
+        finally:
+            shutil.rmtree(roi_sample_dir, ignore_errors=True)
     else:
         raise ValueError("Cannot skip registration without providing --laser-roi.")
 
