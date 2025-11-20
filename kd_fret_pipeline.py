@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 import re
 import shutil
 import subprocess
@@ -400,8 +401,10 @@ wait(3000);
 alignedTitle = "Aligned " + nSlices + " of " + nSlices;
 if (isOpen(alignedTitle)) {{
     selectWindow(alignedTitle);
-}} else {{
+}} else if (isOpen("Aligned")) {{
     selectWindow("Aligned");
+}} else {{
+    throw("Aligned stack window not found; SIFT output is missing");
 }}
 dest = "{path_for_macro(dest_dir)}";
 run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
@@ -460,8 +463,10 @@ wait(3000);
 alignedTitle = "Aligned " + nSlices + " of " + nSlices;
 if (isOpen(alignedTitle)) {{
     selectWindow(alignedTitle);
-}} else {{
+}} else if (isOpen("Aligned")) {{
     selectWindow("Aligned");
+}} else {{
+    throw("Aligned stack window not found; SIFT output is missing");
 }}
 roiManager("Reset");
 roiManager("Open", "{path_for_macro(config.laser_roi_path)}");
@@ -849,6 +854,8 @@ def main() -> None:
             for fov in measurement.fovs:
                 logging.info("Registering %s %s", measurement.name, fov)
                 register_and_crop(ij, measurement, config, fov)
+            logging.info("Pausing 10 seconds after %s to mimic Plugin 1 behavior.", measurement.name)
+            time.sleep(10)
     else:
         logging.info("Skipping registration as requested.")
 
