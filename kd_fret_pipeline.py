@@ -399,8 +399,12 @@ run("Enhance Contrast", "saturated=0.35");
 print("Loaded stack has " + nSlices + " slices, starting SIFT alignment...");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
 wait(4000);
-selectImage("Aligned 54 of 54");
-if (!isOpen("Aligned 54 of 54")) {{
+alignedTitle = "Aligned 54 of 54";
+if (isOpen(alignedTitle)) {{
+    selectWindow(alignedTitle);
+}} else if (isOpen("Aligned")) {{
+    selectWindow("Aligned");
+}} else {{
     print("ERROR: Aligned stack window 'Aligned 54 of 54' not found after SIFT");
     exit();
 }}
@@ -460,8 +464,12 @@ run("Enhance Contrast", "saturated=0.35");
 print("Loaded stack has " + nSlices + " slices, starting SIFT alignment...");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
 wait(4000);
-selectImage("Aligned 54 of 54");
-if (!isOpen("Aligned 54 of 54")) {{
+alignedTitle = "Aligned 54 of 54";
+if (isOpen(alignedTitle)) {{
+    selectWindow(alignedTitle);
+}} else if (isOpen("Aligned")) {{
+    selectWindow("Aligned");
+}} else {{
     print("ERROR: Aligned stack window 'Aligned 54 of 54' not found after SIFT");
     exit();
 }}
