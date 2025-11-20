@@ -397,18 +397,27 @@ File.openSequence(src, "filter={fov} start={config.sequence_start}");
 run("Enhance Contrast", "saturated=0.35");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
 wait(3000);
+alignedTitle = "Aligned " + nSlices + " of " + nSlices;
+if (isOpen(alignedTitle)) {{
+    selectWindow(alignedTitle);
+}} else {{
+    selectWindow("Aligned");
+}}
 dest = "{path_for_macro(dest_dir)}";
 run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
 run("Close All");
 """
     ij.py.run_macro(macro)
+    if not any(dest_dir.glob("*.tif")):
+        raise RuntimeError(
+            f"Failed to materialize aligned stack for {measurement.name} {fov} at {dest_dir}"
+        )
     return dest_dir
 
 
 def prompt_for_laser_roi_from_stack(
     ij: imagej.ImageJ,
     stack_dir: Path,
-    fov: str,
     config: PipelineConfig,
 ) -> None:
     """
@@ -418,7 +427,7 @@ def prompt_for_laser_roi_from_stack(
     macro = f"""
 run("Close All");
 src = "{path_for_macro(stack_dir)}";
-File.openSequence(src, "filter={fov}use start=1");
+File.openSequence(src, "start=1");
 setSlice(nSlices);
 run("Enhance Contrast", "saturated=0.35");
 run("Brightness/Contrast...");
@@ -448,6 +457,12 @@ File.openSequence(src, "filter={fov} start={config.sequence_start}");
 run("Enhance Contrast", "saturated=0.35");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
 wait(3000);
+alignedTitle = "Aligned " + nSlices + " of " + nSlices;
+if (isOpen(alignedTitle)) {{
+    selectWindow(alignedTitle);
+}} else {{
+    selectWindow("Aligned");
+}}
 roiManager("Reset");
 roiManager("Open", "{path_for_macro(config.laser_roi_path)}");
 roiManager("Select", 0);
@@ -823,7 +838,7 @@ def main() -> None:
             dest_dir=roi_sample_dir,
         )
         try:
-            prompt_for_laser_roi_from_stack(ij, roi_sample_dir, sample_fov, config)
+            prompt_for_laser_roi_from_stack(ij, roi_sample_dir, config)
         finally:
             shutil.rmtree(roi_sample_dir, ignore_errors=True)
     else:
