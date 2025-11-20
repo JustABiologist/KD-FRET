@@ -384,7 +384,6 @@ def align_stack_only(
     """
     if dest_dir.exists():
         shutil.rmtree(dest_dir)
-    ensure_dir(dest_dir.parent)
     dest_dir = ensure_dir(dest_dir)
     logging.info(
         "Preparing ROI sample by aligning %s %s into %s",
@@ -417,11 +416,13 @@ print("Saved aligned sequence to " + dest + "/");
 run("Close All");
 """
     ij.py.run_macro(macro)
-    if not any(dest_dir.glob("*.tif")):
+    tiffs = list(dest_dir.glob("*.tif"))
+    logging.debug("Aligned stack files: %s", [f.name for f in tiffs])
+    if not tiffs:
         raise RuntimeError(
             f"Failed to materialize aligned stack for {measurement.name} {fov} at {dest_dir}"
         )
-    logging.info("Aligned stack materialized: %s", dest_dir)
+    logging.info("Aligned stack materialized: %s (%d TIFFs)", dest_dir, len(tiffs))
     return dest_dir
 
 
@@ -853,6 +854,9 @@ def main() -> None:
                         fov=sample_fov,
                         dest_dir=roi_sample_dir,
                     )
+                    prompt_for_laser_roi_from_stack(ij, roi_sample_dir, config)
+                    sample_found = True
+                    break
                 except RuntimeError as exc:
                     logging.warning(
                         "Skipping %s %s for ROI setup: %s",
@@ -860,14 +864,10 @@ def main() -> None:
                         sample_fov,
                         exc,
                     )
-                    shutil.rmtree(roi_sample_dir, ignore_errors=True)
                     continue
-                try:
-                    prompt_for_laser_roi_from_stack(ij, roi_sample_dir, config)
-                    sample_found = True
-                    break
                 finally:
-                    shutil.rmtree(roi_sample_dir, ignore_errors=True)
+                    if roi_sample_dir.exists():
+                        shutil.rmtree(roi_sample_dir, ignore_errors=True)
             if sample_found:
                 break
         if not sample_found:
