@@ -358,7 +358,7 @@ def collect_measurements(input_root: Path, default_group: str) -> List[Measureme
 
 SIFT_PARAMS = (
     "initial_gaussian_blur=1.60 steps_per_scale_octave=3 "
-    "minimum_image_size=64 maximum_image_size=512 "
+    "minimum_image_size=64 maximum_image_size=768 "
     "feature_descriptor_size=4 feature_descriptor_orientation_bins=8 "
     "closest/next_closest_ratio=0.85 maximal_alignment_error=10 "
     "inlier_ratio=0.10 expected_transformation=Rigid interpolate "
