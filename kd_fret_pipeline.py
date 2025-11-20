@@ -384,6 +384,7 @@ def align_stack_only(
     """
     if dest_dir.exists():
         shutil.rmtree(dest_dir)
+    ensure_dir(dest_dir.parent)
     dest_dir = ensure_dir(dest_dir)
     logging.info(
         "Preparing ROI sample by aligning %s %s into %s",
@@ -410,7 +411,9 @@ if (isOpen(alignedTitle)) {{
 }}
 print("Aligned stack active: " + getTitle());
 dest = "{path_for_macro(dest_dir)}";
+print("Saving aligned sequence to " + dest + "/");
 run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
+print("Saved aligned sequence to " + dest + "/");
 run("Close All");
 """
     ij.py.run_macro(macro)
@@ -418,6 +421,7 @@ run("Close All");
         raise RuntimeError(
             f"Failed to materialize aligned stack for {measurement.name} {fov} at {dest_dir}"
         )
+    logging.info("Aligned stack materialized: %s", dest_dir)
     return dest_dir
 
 
