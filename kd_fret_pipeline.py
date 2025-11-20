@@ -358,7 +358,7 @@ def collect_measurements(input_root: Path, default_group: str) -> List[Measureme
 
 SIFT_PARAMS = (
     "initial_gaussian_blur=1.60 steps_per_scale_octave=3 "
-    "minimum_image_size=64 maximum_image_size=768 "
+    "minimum_image_size=64 maximum_image_size=512 "
     "feature_descriptor_size=4 feature_descriptor_orientation_bins=8 "
     "closest/next_closest_ratio=0.85 maximal_alignment_error=10 "
     "inlier_ratio=0.10 expected_transformation=Rigid interpolate "
@@ -397,15 +397,9 @@ src = "{path_for_macro(measurement.source_dir)}";
 File.openSequence(src, "filter={fov} start={config.sequence_start}");
 run("Enhance Contrast", "saturated=0.35");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
-wait(3000);
-alignedTitle = "Aligned " + nSlices + " of " + nSlices;
-if (isOpen(alignedTitle)) {{
-    selectWindow(alignedTitle);
-}} else if (isOpen("Aligned")) {{
-    selectWindow("Aligned");
-}} else {{
-    throw("Aligned stack window not found; SIFT output is missing");
-}}
+wait(4000);
+selectImage("Aligned 54 of 54");
+print("Aligned stack active: " + getTitle());
 dest = "{path_for_macro(dest_dir)}";
 run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
 run("Close All");
@@ -459,15 +453,9 @@ src = "{path_for_macro(measurement.source_dir)}";
 File.openSequence(src, "filter={fov} start={config.sequence_start}");
 run("Enhance Contrast", "saturated=0.35");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
-wait(3000);
-alignedTitle = "Aligned " + nSlices + " of " + nSlices;
-if (isOpen(alignedTitle)) {{
-    selectWindow(alignedTitle);
-}} else if (isOpen("Aligned")) {{
-    selectWindow("Aligned");
-}} else {{
-    throw("Aligned stack window not found; SIFT output is missing");
-}}
+wait(4000);
+selectImage("Aligned 54 of 54");
+print("Aligned stack active: " + getTitle());
 roiManager("Reset");
 roiManager("Open", "{path_for_macro(config.laser_roi_path)}");
 roiManager("Select", 0);
