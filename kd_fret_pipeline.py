@@ -310,14 +310,6 @@ def path_for_macro(path: Path) -> str:
     return str(path).replace("\\", "/")
 
 
-def find_first_tiff(folder: Path) -> Optional[Path]:
-    for candidate in folder.rglob("*.tif"):
-        return candidate
-    for candidate in folder.rglob("*.tiff"):
-        return candidate
-    return None
-
-
 def detect_fovs(measurement_dir: Path) -> List[str]:
     """Collect xyNN labels present inside a measurement folder."""
     fov_dirs = [
@@ -369,22 +361,40 @@ def init_imagej(distribution: Optional[str]) -> imagej.ImageJ:
     return ij
 
 
-def prompt_for_laser_roi(ij: imagej.ImageJ, sample_image: Path, roi_path: Path) -> None:
-    logging.info("Prompting for the laser ROI using sample %s", sample_image)
+def prompt_for_laser_roi(
+    ij: imagej.ImageJ,
+    measurement: Measurement,
+    fov: str,
+    config: PipelineConfig,
+) -> None:
+    logging.info(
+        "Aligning sample stack (%s %s) for ROI definition...", measurement.name, fov
+    )
+    # Note: We replicate the alignment logic from register_and_crop exactly
+    # but we pause to let the user draw the ROI on the ALIGNED stack.
     macro = f"""
+setBatchMode(true);
 run("Close All");
-open("{path_for_macro(sample_image)}");
+src = "{path_for_macro(measurement.source_dir)}";
+File.openSequence(src, "filter={fov} start={config.sequence_start}");
+run("Linear Stack Alignment with SIFT", "initial_gaussian_blur=1.60 steps_per_scale_octave=3 "
+    + "minimum_image_size=64 maximum_image_size=512 feature_descriptor_size=4 "
+    + "feature_descriptor_orientation_bins=8 closest/next_closest_ratio=0.85 "
+    + "maximal_alignment_error=10 inlier_ratio=0.10 expected_transformation=Rigid "
+    + "interpolate show_info");
+setSlice(nSlices);
 run("Enhance Contrast", "saturated=0.35");
+setBatchMode("exit and display");
 run("Brightness/Contrast...");
-waitForUser("Laser ROI", "Draw the bleaching ROI.\\n\\nAdjust Brightness/Contrast if needed to see cells.\\nThen press OK.");
+waitForUser("Laser ROI", "Draw the bleaching ROI on this ALIGNED stack (Frame " + nSlices + ").\\n\\nAdjust Brightness/Contrast if needed.\\nThen press OK.");
 roiManager("Reset");
 roiManager("Add");
 roiManager("Select", 0);
-roiManager("Save", "{path_for_macro(roi_path)}");
+roiManager("Save", "{path_for_macro(config.laser_roi_path)}");
 run("Close All");
 """
     ij.py.run_macro(macro)
-    logging.info("Saved laser ROI to %s", roi_path)
+    logging.info("Saved laser ROI to %s", config.laser_roi_path)
 
 
 def register_and_crop(
@@ -771,10 +781,10 @@ def main() -> None:
         config.laser_roi_path = config.reuse_laser_roi.resolve()
         logging.info("Using existing ROI at %s", config.laser_roi_path)
     elif not config.skip_registration:
-        sample_image = find_first_tiff(config.input_root)
-        if not sample_image:
-            raise FileNotFoundError("Unable to locate a sample TIFF for ROI definition.")
-        prompt_for_laser_roi(ij, sample_image, config.laser_roi_path)
+        # Use the first available measurement/FOV as the sample
+        sample_measurement = measurements[0]
+        sample_fov = sample_measurement.fovs[0]
+        prompt_for_laser_roi(ij, sample_measurement, sample_fov, config)
     else:
         raise ValueError("Cannot skip registration without providing --laser-roi.")
 
