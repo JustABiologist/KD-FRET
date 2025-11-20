@@ -400,10 +400,10 @@ print("Loaded stack has " + nSlices + " slices, starting SIFT alignment...");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
 wait(4000);
 selectImage("Aligned 54 of 54");
-if (!isOpen("Aligned 54 of 54")) {
+if (!isOpen("Aligned 54 of 54")) {{
     print("ERROR: Aligned stack window 'Aligned 54 of 54' not found after SIFT");
     exit();
-}
+}}
 print("Aligned stack active: " + getTitle());
 dest = "{path_for_macro(dest_dir)}";
 run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
@@ -461,10 +461,10 @@ print("Loaded stack has " + nSlices + " slices, starting SIFT alignment...");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
 wait(4000);
 selectImage("Aligned 54 of 54");
-if (!isOpen("Aligned 54 of 54")) {
+if (!isOpen("Aligned 54 of 54")) {{
     print("ERROR: Aligned stack window 'Aligned 54 of 54' not found after SIFT");
     exit();
-}
+}}
 print("Aligned stack active: " + getTitle());
 roiManager("Reset");
 roiManager("Open", "{path_for_macro(config.laser_roi_path)}");
