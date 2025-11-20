@@ -1,0 +1,1 @@
+python kd_fret_pipeline.py --input-root C:\Users\gruenf\Desktop\20251119 --output-root C:\Users\gruenf\Desktop\ResultsFRET --background-donor 250 --background-acceptor 250 --iptg-concentrations 3 10 50 100 200
