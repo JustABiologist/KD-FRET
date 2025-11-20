@@ -829,21 +829,39 @@ def main() -> None:
         config.laser_roi_path = config.reuse_laser_roi.resolve()
         logging.info("Using existing ROI at %s", config.laser_roi_path)
     elif not config.skip_registration:
-        # Use the first available measurement/FOV as the sample
-        sample_measurement = measurements[0]
-        sample_fov = sample_measurement.fovs[0]
         roi_sample_dir = config.registered_root / "__roi_sample__"
-        align_stack_only(
-            ij=ij,
-            measurement=sample_measurement,
-            config=config,
-            fov=sample_fov,
-            dest_dir=roi_sample_dir,
-        )
-        try:
-            prompt_for_laser_roi_from_stack(ij, roi_sample_dir, config)
-        finally:
-            shutil.rmtree(roi_sample_dir, ignore_errors=True)
+        sample_found = False
+        for sample_measurement in measurements:
+            for sample_fov in sample_measurement.fovs:
+                try:
+                    align_stack_only(
+                        ij=ij,
+                        measurement=sample_measurement,
+                        config=config,
+                        fov=sample_fov,
+                        dest_dir=roi_sample_dir,
+                    )
+                except RuntimeError as exc:
+                    logging.warning(
+                        "Skipping %s %s for ROI setup: %s",
+                        sample_measurement.name,
+                        sample_fov,
+                        exc,
+                    )
+                    shutil.rmtree(roi_sample_dir, ignore_errors=True)
+                    continue
+                try:
+                    prompt_for_laser_roi_from_stack(ij, roi_sample_dir, config)
+                    sample_found = True
+                    break
+                finally:
+                    shutil.rmtree(roi_sample_dir, ignore_errors=True)
+            if sample_found:
+                break
+        if not sample_found:
+            raise RuntimeError(
+                "Unable to align any FOV for ROI definition; check image contrast or SIFT settings."
+            )
     else:
         raise ValueError("Cannot skip registration without providing --laser-roi.")
 
