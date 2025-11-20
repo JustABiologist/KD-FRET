@@ -378,7 +378,7 @@ run("Close All");
 src = "{path_for_macro(measurement.source_dir)}";
 File.openSequence(src, "filter={fov} start={config.sequence_start}");
 run("Linear Stack Alignment with SIFT", "initial_gaussian_blur=1.60 steps_per_scale_octave=3 "
-    + "minimum_image_size=64 maximum_image_size=512 feature_descriptor_size=4 "
+    + "minimum_image_size=64 maximum_image_size=4096 feature_descriptor_size=4 "
     + "feature_descriptor_orientation_bins=8 closest/next_closest_ratio=0.85 "
     + "maximal_alignment_error=10 inlier_ratio=0.10 expected_transformation=Rigid "
     + "interpolate show_info");
@@ -412,7 +412,7 @@ src = "{path_for_macro(measurement.source_dir)}";
 File.openSequence(src, "filter={fov} start={config.sequence_start}");
 run("Enhance Contrast", "saturated=0.35");
 run("Linear Stack Alignment with SIFT", "initial_gaussian_blur=1.60 steps_per_scale_octave=3 "
-    + "minimum_image_size=64 maximum_image_size=512 feature_descriptor_size=4 "
+    + "minimum_image_size=64 maximum_image_size=4096 feature_descriptor_size=4 "
     + "feature_descriptor_orientation_bins=8 closest/next_closest_ratio=0.85 "
     + "maximal_alignment_error=10 inlier_ratio=0.10 expected_transformation=Rigid "
     + "interpolate show_info");
