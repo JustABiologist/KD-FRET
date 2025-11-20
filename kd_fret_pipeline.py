@@ -374,7 +374,9 @@ def prompt_for_laser_roi(ij: imagej.ImageJ, sample_image: Path, roi_path: Path) 
     macro = f"""
 run("Close All");
 open("{path_for_macro(sample_image)}");
-waitForUser("Laser ROI", "Draw the bleaching ROI, then press OK.");
+run("Enhance Contrast", "saturated=0.35");
+run("Brightness/Contrast...");
+waitForUser("Laser ROI", "Draw the bleaching ROI.\\n\\nAdjust Brightness/Contrast if needed to see cells.\\nThen press OK.");
 roiManager("Reset");
 roiManager("Add");
 roiManager("Select", 0);
