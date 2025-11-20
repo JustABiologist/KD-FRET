@@ -1,0 +1,16 @@
+name: kd-fret
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pyimagej=1.5.2
+  - openjdk=11
+  - numpy>=1.26
+  - pandas>=2.1
+  - cellpose>=3.0
+  - scikit-image>=0.22
+  - pip
+  - pip:
+      - typer>=0.12
+
+

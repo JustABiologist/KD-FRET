@@ -1,0 +1,45 @@
+PLUGIN 1 (ImageJ)Registration of the entire image then Crop then Save the registered image sequence
+Input folder: folder containing the folders exported from the microscope that should be named measurement1, …
+Output folder: creates folders called Measurement1, … in desired destination
+
+PLUGIN 2 (ImageJ)Extract (copy) one file (we choose  #5 of the donor pre-bleaching) from each FOV measurement.Save each of them in the same folder.Input: output of Plugin 1
+Output: single images in separate folder
+
+
+Cellpose
+YOU JUST NEED TO BE IN C:\Users\malengoG> (with your own name of course)
+AND THERE YOU NEED TO WRITE:conda activate cellposewhich brings you to: (cellpose) C:\Users\malengoG>
+Visualize the GUI interface which is a good idea to check how things work you need to write:python -m cellpose However the GUI only allows to run the segmentation of one image at a time so it´s not very practical.Therefore run the following, note that it doesn´t seem to work unless you write it in one line (just copy in word and use very small font) (input: output of Plugin 2; output will be saved in the same folder as input):
+cellpose --dir "Q:\Members\Lisa Werland\Results\2 Dynamics of regulation of PhoQ by SafA and MgrB\1 Bleach FRET\4 Binding affinity\20250327\input images for cellpose" --pretrained_model bact_fluor_cp3 --diameter 25 --save_tif --save_png --save_outlines --save_rois --save_txt --verbose
+The value of 25 for the diameter is the result of the optimization ran on the calibration
+
+
+PLUGIN 3 (ImageJ)
+Make new folder „Analysis Bleaching“ by hand
+Measuring the ROIs discriminating the bleached and unbleached ones.
+Input folder images: output folder of Plugin 1
+Input folder ROI zip foles: output folder of Plugin 2
+Bleached/Unbleached ROI: draw by hand based on a few image sequences
+Output: new folder with .csv files
+Make sure „Set Measurements“ looks like this:
+Ticked Area, Standard deviaton, Mean gray value, Fit ellipse
+
+PLUGIN 4 (Python)to run in Anaconda, handling the results from bleach fret and creating a new file.
+Copy output of Plugin 3 to C:\Users\WerlandL\FRET (input for Plugin4.py)
+In Anaconda go inside C:\Users\WerlandL
+Run Plugin4.py
+Saves output in C:\Users\WerlandL\FRET2
+PLUGIN 5 (Python)to run in Anaconda, handling the results from bleach fret and creating a new file.
+Change BG lines 34 & 83
+In Anaconda go inside C:\Users\WerlandL
+Run Plugin5.py (uses C:\Users\WerlandL\FRET2 as input and saves output in C:\Users\WerlandL\FRET3)
+PLUGIN 7 (Excel)we need to use an excel macro to convert csv in xlsx as when we do it with python it does it but the next step constantly fails
+Open new Excel sheet
+Developer → Macros → paste text of Plugin7.txt
+Select all → Run (uses C:\Users\WerlandL\FRET3 as input and creates subfolder „XLSX“)
+PLUGIN 8 (Python)this gives us transposed readable files
+In Anaconda go inside C:\Users\WerlandL
+Run Plugin8.py (uses C:\Users\WerlandL\FRET3\XLSX as input and overwrites the original files as output)
+PLUGIN 9 (Python)this gives us transposed readable files and cut bleached <70%
+In Anaconda go inside C:\Users\WerlandL
+Run Plugin9.py (uses C:\Users\WerlandL\FRET3\XLSX as input and creates files DaySummaryIN and DaySummaryOUT as output)
