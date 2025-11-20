@@ -124,8 +124,9 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "input_root",
+        "--input-root",
         type=Path,
+        required=True,
         help="Folder containing measurement sub-folders (measurement1, ...).",
     )
     parser.add_argument(
