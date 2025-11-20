@@ -410,9 +410,14 @@ if (isOpen(alignedTitle)) {{
 }}
 print("Aligned stack active: " + getTitle());
 dest = "{path_for_macro(dest_dir)}";
+if (!File.exists(dest)) {{
+    File.makeDirectory(dest);
+}}
 print("Saving aligned sequence to " + dest + "/");
-run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
+run("Image Sequence... ", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
 print("Saved aligned sequence to " + dest + "/");
+list = getFileList(dest + "/");
+print("Verified " + list.length + " files in destination.");
 run("Close All");
 """
     ij.py.run_macro(macro)
@@ -486,9 +491,14 @@ run("Crop");
 run("Enhance Contrast", "saturated=0.35");
 resetMinAndMax();
     dest = "{path_for_macro(dest_dir)}";
+    if (!File.exists(dest)) {{
+        File.makeDirectory(dest);
+    }}
     print("Saving cropped sequence to " + dest + "/");
-    run("Image Sequence...", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
+    run("Image Sequence... ", "select=[" + dest + "/] dir=[" + dest + "/] format=TIFF name={fov}use");
     print("Saved cropped sequence to " + dest + "/");
+    list = getFileList(dest + "/");
+    print("Verified " + list.length + " files in destination.");
 run("Close All");
 """
     ij.py.run_macro(macro)
@@ -844,7 +854,7 @@ def main() -> None:
         config.laser_roi_path = config.reuse_laser_roi.resolve()
         logging.info("Using existing ROI at %s", config.laser_roi_path)
     elif not config.skip_registration:
-        roi_sample_dir = config.registered_root / "__roi_sample__"
+        roi_sample_dir = config.registered_root / "roi_temp"
         sample_found = False
         for sample_measurement in measurements:
             for sample_fov in sample_measurement.fovs:
