@@ -529,7 +529,7 @@ def extract_cellpose_frames(
     target_name = f"{measurement.name}{fov}use{frame_index:04d}.tif"
     dest = cellpose_dir / target_name
     shutil.copyfile(selected, dest)
-    mask_path = dest.with_name(dest.stem + "_masks.tif")
+    mask_path = dest.with_name(dest.stem + "_cp_masks.tif")
     return dest, mask_path
 
 
