@@ -11,7 +11,7 @@ It orchestrates the following steps:
 3. Optional execution of the Cellpose CLI to generate masks/ROIs.
 4. Quantification of each registered stack using the Cellpose masks.
 5. Computation of the donor/acceptor summary statistics used downstream.
-6. Consolidation of the experiment into an appendable CSV (or DataFrame).
+6. Consolidation of the experiment into an appendable CSV plus an Excel workbook.
 
 Assumptions that are in line with the original workflow:
 * Measurement folders are named measurementX (case-insensitive) and contain
@@ -94,6 +94,7 @@ class PipelineConfig:
     registered_root: Path
     cellpose_input: Path
     results_csv: Path
+    results_xlsx: Path
     backgrounds: Tuple[float, float]
     sequence_start: int
     cellpose_frame_index: int
@@ -112,6 +113,7 @@ class PipelineConfig:
     iptg_concentrations: List[float]
     fovs_per_iptg: int
     run_id: str
+    csv_decimal: str
 
 
 # --------------------------------------------------------------------------------------
@@ -232,6 +234,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to an existing CSV that should be appended.",
     )
     parser.add_argument(
+        "--results-xlsx",
+        type=Path,
+        default=None,
+        help="Optional Excel file path; defaults to <output_root>/fret_results.xlsx.",
+    )
+    parser.add_argument(
         "--iptg-concentrations",
         type=float,
         nargs="+",
@@ -249,6 +257,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=datetime.now().strftime("%Y%m%d_%H%M%S"),
         help="Run identifier stored in the final CSV.",
+    )
+    parser.add_argument(
+        "--csv-decimal",
+        type=str,
+        choices=[".", ","],
+        default=".",
+        help="Decimal separator to use when reading/writing CSV outputs.",
     )
     parser.add_argument(
         "--log-level",
@@ -746,15 +761,23 @@ def process_measurements(
     return df
 
 
-def append_and_save(df: pd.DataFrame, config: PipelineConfig) -> Path:
+def append_and_save(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
     ensure_dir(config.results_csv.parent)
     if config.results_csv.exists():
         logging.info("Appending to existing results at %s", config.results_csv)
-        previous = pd.read_csv(config.results_csv)
+        previous = pd.read_csv(config.results_csv, decimal=config.csv_decimal)
         df = pd.concat([previous, df], ignore_index=True)
-    df.to_csv(config.results_csv, index=False)
+    df.to_csv(config.results_csv, index=False, decimal=config.csv_decimal)
     logging.info("Saved %s rows to %s", len(df), config.results_csv)
-    return config.results_csv
+    return df
+
+
+def save_excel(df: pd.DataFrame, config: PipelineConfig) -> Path:
+    ensure_dir(config.results_xlsx.parent)
+    with pd.ExcelWriter(config.results_xlsx, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Results")
+    logging.info("Saved %s rows to %s", len(df), config.results_xlsx)
+    return config.results_xlsx
 
 
 # --------------------------------------------------------------------------------------
@@ -831,6 +854,11 @@ def main() -> None:
             if args.existing_results
             else (args.output_root / "fret_results.csv").resolve()
         ),
+        results_xlsx=(
+            args.results_xlsx.resolve()
+            if args.results_xlsx
+            else (args.output_root / "fret_results.xlsx").resolve()
+        ),
         backgrounds=(args.background_donor, args.background_acceptor),
         sequence_start=args.sequence_start,
         cellpose_frame_index=args.cellpose_frame_index,
@@ -849,6 +877,7 @@ def main() -> None:
         iptg_concentrations=args.iptg_concentrations,
         fovs_per_iptg=args.fovs_per_iptg,
         run_id=args.run_id,
+        csv_decimal=args.csv_decimal,
     )
 
     ensure_dir(config.output_root)
@@ -929,7 +958,8 @@ def main() -> None:
         return
 
     df = process_measurements(contexts, config)
-    append_and_save(df, config)
+    combined_df = append_and_save(df, config)
+    save_excel(combined_df, config)
 
 
 if __name__ == "__main__":
