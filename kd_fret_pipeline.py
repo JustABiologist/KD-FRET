@@ -102,8 +102,12 @@ class PipelineConfig:
     min_bleach_percent: float
     imagej_distribution: Optional[str]
     default_group: str
-    reuse_laser_roi: Optional[Path]
-    laser_roi_path: Path
+    reuse_rois: bool
+    crop_roi_path: Path
+    bleached_roi_path: Path
+    unbleached_roi_path: Path
+    bleached_mask_path: Path
+    unbleached_mask_path: Path
     skip_registration: bool
     skip_cellpose: bool
     skip_measurement: bool
@@ -187,10 +191,9 @@ def parse_args() -> argparse.Namespace:
         help="Fallback label if a measurement name does not encode IN/OUT.",
     )
     parser.add_argument(
-        "--laser-roi",
-        type=Path,
-        default=None,
-        help="Reuse an existing ROI instead of prompting inside ImageJ.",
+        "--reuse-rois",
+        action="store_true",
+        help="Reuse existing ROIs (crop.roi, bleached.roi, unbleached.roi) if they exist.",
     )
     parser.add_argument(
         "--skip-registration",
@@ -453,32 +456,86 @@ run("Close All");
     return dest_dir
 
 
-def prompt_for_laser_roi_from_stack(
+def prompt_for_rois(
     ij: imagej.ImageJ,
     stack_dir: Path,
     config: PipelineConfig,
 ) -> None:
     """
-    Open an already aligned stack (mCherry channel) and let the user draw the bleaching ROI.
+    Open an already aligned stack and prompt for Crop, Bleached, and Unbleached ROIs.
+    Generates binary masks for Bleached/Unbleached relative to the cropped image.
     """
     logging.info("Opening aligned stack at %s for ROI definition.", stack_dir)
+    
+    # Ensure paths are absolute and posix style for ImageJ
+    crop_roi_str = path_for_macro(config.crop_roi_path)
+    bleached_roi_str = path_for_macro(config.bleached_roi_path)
+    unbleached_roi_str = path_for_macro(config.unbleached_roi_path)
+    bleached_mask_str = path_for_macro(config.bleached_mask_path)
+    unbleached_mask_str = path_for_macro(config.unbleached_mask_path)
+
     macro = f"""
-run("Close All");
-src = "{path_for_macro(stack_dir)}";
-File.openSequence(src, "start=1");
-setSlice(nSlices);
-run("Enhance Contrast", "saturated=0.40");
-run("Brightness/Contrast...");
-setTool("oval");
-waitForUser("Laser ROI", "Draw the bleaching ROI on this aligned stack (Frame " + nSlices + ").\\n\\nUse the Toolbar to switch to Rectangle if needed.\\nAdjust Brightness/Contrast if needed.\\nThen press OK.");
-roiManager("Reset");
-roiManager("Add");
-roiManager("Select", 0);
-roiManager("Save", "{path_for_macro(config.laser_roi_path)}");
-run("Close All");
-"""
+    run("Close All");
+    roiManager("Reset");
+    
+    // 1. Load Stack and Prompt for Crop ROI
+    src = "{path_for_macro(stack_dir)}";
+    File.openSequence(src, "start=1");
+    setSlice(nSlices);
+    run("Enhance Contrast", "saturated=0.40");
+    
+    setTool("rectangle");
+    waitForUser("Crop ROI", "Draw the CROP ROI (Laser ROI/Valid Area).\\n\\nThen press OK.");
+    roiManager("Add");
+    roiManager("Select", 0);
+    roiManager("Save", "{crop_roi_str}");
+    
+    // 2. Crop the image to define the coordinate system for subsequent ROIs
+    run("Crop");
+    run("Enhance Contrast", "saturated=0.35");
+    
+    // 3. Prompt for Bleached ROI
+    setTool("freehand");
+    waitForUser("Bleached ROI", "Draw the BLEACHED (IN) ROI on the CROPPED image.\\n\\nThen press OK.");
+    roiManager("Reset");
+    roiManager("Add");
+    roiManager("Select", 0);
+    roiManager("Save", "{bleached_roi_str}");
+    
+    // Generate Bleached Mask
+    w = getWidth();
+    h = getHeight();
+    newImage("BleachedMask", "8-bit black", w, h, 1);
+    roiManager("Select", 0);
+    setForegroundColor(255, 255, 255);
+    run("Fill");
+    saveAs("Tiff", "{bleached_mask_str}");
+    close(); 
+    // Close mask, back to cropped stack
+    
+    // 4. Prompt for Unbleached ROI
+    // Re-select cropped stack (should be the only one open besides log/etc, but let's be safe)
+    // Actually we just closed the mask, so the previous image (cropped stack) should be active.
+    
+    setTool("freehand");
+    waitForUser("Unbleached ROI", "Draw the UNBLEACHED (OUT) ROI on the CROPPED image.\\n\\nThen press OK.");
+    roiManager("Reset");
+    roiManager("Add");
+    roiManager("Select", 0);
+    roiManager("Save", "{unbleached_roi_str}");
+    
+    // Generate Unbleached Mask
+    newImage("UnbleachedMask", "8-bit black", w, h, 1);
+    roiManager("Select", 0);
+    setForegroundColor(255, 255, 255);
+    run("Fill");
+    saveAs("Tiff", "{unbleached_mask_str}");
+    close();
+    
+    run("Close All");
+    """
     ij.py.run_macro(macro)
-    logging.info("Saved laser ROI to %s", config.laser_roi_path)
+    logging.info("Saved ROIs and masks to %s", config.output_root)
 
 
 def register_and_crop(
@@ -508,7 +565,7 @@ if (isOpen(alignedTitle)) {{
 }}
 print("Aligned stack active: " + getTitle());
 roiManager("Reset");
-roiManager("Open", "{path_for_macro(config.laser_roi_path)}");
+roiManager("Open", "{path_for_macro(config.crop_roi_path)}");
 roiManager("Select", 0);
 run("Crop");
 run("Enhance Contrast", "saturated=0.35");
@@ -609,6 +666,8 @@ def load_mask(mask_path: Path) -> np.ndarray:
 def compute_roi_timeseries(
     stack: np.ndarray,
     mask: np.ndarray,
+    bleached_mask: Optional[np.ndarray],
+    unbleached_mask: Optional[np.ndarray],
     measurement: Measurement,
     fov: str,
     stack_dir: Path,
@@ -621,111 +680,153 @@ def compute_roi_timeseries(
         raise ValueError(
             f"Mask mismatch for {measurement.name}-{fov}: stack {stack.shape[1:]}, mask {mask.shape}"
         )
+    
+    # Prepare masked stacks for IN (Bleached) and OUT (Unbleached) analysis
+    # Legacy behavior: 'Clear Outside' sets pixels outside the ROI to 0.
+    # We replicate this by multiplying the stack with the binary masks (0 or 1).
+    
+    stacks_to_process = []
+    if bleached_mask is not None:
+        # Ensure mask matches stack dimensions
+        if bleached_mask.shape != stack.shape[1:]:
+             # Resize or pad if necessary? Assume strict match for now.
+             pass 
+        # Convert to boolean or 0/1
+        b_mask = (bleached_mask > 0).astype(stack.dtype)
+        stack_in = stack * b_mask
+        stacks_to_process.append(("IN", stack_in))
+    
+    if unbleached_mask is not None:
+        ub_mask = (unbleached_mask > 0).astype(stack.dtype)
+        stack_out = stack * ub_mask
+        stacks_to_process.append(("OUT", stack_out))
+        
+    if not stacks_to_process:
+        # Fallback if no spatial masks provided (should not happen in standard flow)
+        stacks_to_process.append(("ALL", stack))
+
     props = {prop.label: prop for prop in regionprops(mask)}
     labels = sorted(label for label in np.unique(mask) if label > 0)
     records: List[Dict[str, object]] = []
     bg_don, bg_acc = config.backgrounds
     frame_numbers = np.arange(1, stack.shape[0] + 1)
-    for label in labels:
-        cell_mask = mask == label
-        area_px = int(cell_mask.sum())
-        prop = props.get(label)
-        if prop is None:
-            continue
-        angle = float(np.degrees(prop.orientation))
-        major = float(prop.major_axis_length)
-        minor = float(prop.minor_axis_length)
-        series = stack[:, cell_mask]
-        mean_series = series.mean(axis=1)
-        std_series = series.std(axis=1, ddof=0)
+    
+    for group_label, current_stack in stacks_to_process:
+        for label in labels:
+            cell_mask = mask == label
+            area_px = int(cell_mask.sum())
+            prop = props.get(label)
+            if prop is None:
+                continue
+                
+            # --- Legacy Filtering Logic ---
+            # In Plugin 3, if Mean == 0 after 'Clear Outside', the ROI is deleted.
+            # We check if the cell has any signal in the current spatially masked stack.
+            # We use the mean of the entire series or just the first frame? 
+            # Plugin 3 measures "Mean". If we assume it measures the whole stack (Multi Measure),
+            # then if the mean of the stack is 0, it's empty.
+            
+            series = current_stack[:, cell_mask]
+            mean_series = series.mean(axis=1)
+            
+            if np.all(mean_series == 0):
+                # Cell is completely outside the Bleached/Unbleached ROI
+                continue
 
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ratio_series = np.where(std_series != 0, mean_series / std_series, np.nan)
-        avg_ratio = np.nanmean(ratio_series)
-        if np.isnan(avg_ratio) or avg_ratio < config.min_quality_ratio:
-            logging.debug(
-                "Discarding %s-%s label %s due to quality ratio %.3f",
-                measurement.name,
-                fov,
-                label,
-                avg_ratio,
-            )
-            continue
+            angle = float(np.degrees(prop.orientation))
+            major = float(prop.major_axis_length)
+            minor = float(prop.minor_axis_length)
+            
+            std_series = series.std(axis=1, ddof=0)
 
-        def avg_range(start: int, end: int) -> float:
-            sl = slice(start - 1, end)
-            return float(np.nanmean(mean_series[sl]))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio_series = np.where(std_series != 0, mean_series / std_series, np.nan)
+            avg_ratio = np.nanmean(ratio_series)
+            if np.isnan(avg_ratio) or avg_ratio < config.min_quality_ratio:
+                logging.debug(
+                    "Discarding %s-%s label %s (%s) due to quality ratio %.3f",
+                    measurement.name,
+                    fov,
+                    label,
+                    group_label,
+                    avg_ratio,
+                )
+                continue
 
-        don_bb = avg_range(26, 28)
-        don_ab = avg_range(29, 31)
-        acc_bb = avg_range(2, 3)
-        acc_ab = avg_range(54, 55)
+            def avg_range(start: int, end: int) -> float:
+                sl = slice(start - 1, end)
+                return float(np.nanmean(mean_series[sl]))
 
-        don_bb_bg = don_bb - bg_don
-        don_ab_bg = don_ab - bg_don
-        acc_bb_bg = acc_bb - bg_acc
-        acc_ab_bg = acc_ab - bg_acc
+            don_bb = avg_range(26, 28)
+            don_ab = avg_range(29, 31)
+            acc_bb = avg_range(2, 3)
+            acc_ab = avg_range(54, 55)
 
-        fret = np.nan
-        corr_fret = np.nan
-        bleached = np.nan
-        fac = np.nan
-        ratio_metric = np.nan
+            don_bb_bg = don_bb - bg_don
+            don_ab_bg = don_ab - bg_don
+            acc_bb_bg = acc_bb - bg_acc
+            acc_ab_bg = acc_ab - bg_acc
 
-        if don_ab_bg != 0:
-            fret = 100.0 * (don_ab_bg - don_bb_bg) / don_ab_bg
+            fret = np.nan
+            corr_fret = np.nan
+            bleached = np.nan
+            fac = np.nan
+            ratio_metric = np.nan
 
-        if acc_bb_bg != 0:
-            bleached = 100.0 * (acc_bb_bg - acc_ab_bg) / acc_bb_bg
+            if don_ab_bg != 0:
+                fret = 100.0 * (don_ab_bg - don_bb_bg) / don_ab_bg
 
-        if not np.isnan(bleached):
-            fac = (100.0 - bleached) / 100.0
+            if acc_bb_bg != 0:
+                bleached = 100.0 * (acc_bb_bg - acc_ab_bg) / acc_bb_bg
 
-        denominator = don_ab_bg - (fac * don_bb_bg if not np.isnan(fac) else 0.0)
-        if denominator != 0:
-            corr_fret = 100.0 * (don_ab_bg - don_bb_bg) / denominator
+            if not np.isnan(bleached):
+                fac = (100.0 - bleached) / 100.0
 
-        if don_ab_bg != 0:
-            ratio_metric = acc_bb_bg / don_ab_bg
+            denominator = don_ab_bg - (fac * don_bb_bg if not np.isnan(fac) else 0.0)
+            if denominator != 0:
+                corr_fret = 100.0 * (don_ab_bg - don_bb_bg) / denominator
 
-        record = {
-            "run_id": config.run_id,
-            "measurement": measurement.name,
-            "measurement_group": measurement.group,
-            "fov": fov,
-            "fov_index": fov_index,
-            "iptg_concentration": iptg_concentration,
-            "cell_label": int(label),
-            "frame_count": int(stack.shape[0]),
-            "area_px": area_px,
-            "major_axis_px": major,
-            "minor_axis_px": minor,
-            "angle_deg": angle,
-            "quality_ratio": float(avg_ratio),
-            "DonBB": don_bb,
-            "DonAB": don_ab,
-            "AccBB": acc_bb,
-            "AccAB": acc_ab,
-            "BG_don": bg_don,
-            "BG_acc": bg_acc,
-            "DonBB_BG": don_bb_bg,
-            "DonAB_BG": don_ab_bg,
-            "AccBB_BG": acc_bb_bg,
-            "ACCAB_BG": acc_ab_bg,
-            "FRET": fret,
-            "BleachedPercent": bleached,
-            "Fac": fac,
-            "CorrFRET": corr_fret,
-            "Ratio": ratio_metric,
-            "BleachedPass": (
-                False
-                if np.isnan(bleached)
-                else bool(bleached >= config.min_bleach_percent)
-            ),
-            "source_stack_dir": str(stack_dir),
-            "cellpose_mask_path": str(mask_path),
-        }
-        records.append(record)
+            if don_ab_bg != 0:
+                ratio_metric = acc_bb_bg / don_ab_bg
+
+            record = {
+                "run_id": config.run_id,
+                "measurement": measurement.name,
+                "measurement_group": group_label,  # IN or OUT
+                "fov": fov,
+                "fov_index": fov_index,
+                "iptg_concentration": iptg_concentration,
+                "cell_label": int(label),
+                "frame_count": int(stack.shape[0]),
+                "area_px": area_px,
+                "major_axis_px": major,
+                "minor_axis_px": minor,
+                "angle_deg": angle,
+                "quality_ratio": float(avg_ratio),
+                "DonBB": don_bb,
+                "DonAB": don_ab,
+                "AccBB": acc_bb,
+                "AccAB": acc_ab,
+                "BG_don": bg_don,
+                "BG_acc": bg_acc,
+                "DonBB_BG": don_bb_bg,
+                "DonAB_BG": don_ab_bg,
+                "AccBB_BG": acc_bb_bg,
+                "ACCAB_BG": acc_ab_bg,
+                "FRET": fret,
+                "BleachedPercent": bleached,
+                "Fac": fac,
+                "CorrFRET": corr_fret,
+                "Ratio": ratio_metric,
+                "BleachedPass": (
+                    False
+                    if np.isnan(bleached)
+                    else bool(bleached >= config.min_bleach_percent)
+                ),
+                "source_stack_dir": str(stack_dir),
+                "cellpose_mask_path": str(mask_path),
+            }
+            records.append(record)
     return records
 
 
@@ -733,6 +834,17 @@ def process_measurements(
     contexts: List[FovContext],
     config: PipelineConfig,
 ) -> pd.DataFrame:
+    # Load global spatial masks if they exist
+    bleached_mask = None
+    if config.bleached_mask_path.exists():
+        bleached_mask = tifffile.imread(config.bleached_mask_path)
+        logging.info("Loaded bleached mask from %s", config.bleached_mask_path)
+    
+    unbleached_mask = None
+    if config.unbleached_mask_path.exists():
+        unbleached_mask = tifffile.imread(config.unbleached_mask_path)
+        logging.info("Loaded unbleached mask from %s", config.unbleached_mask_path)
+
     all_records: List[Dict[str, object]] = []
     for ctx in contexts:
         if not ctx.registered_stack_dir.exists():
@@ -746,6 +858,8 @@ def process_measurements(
         records = compute_roi_timeseries(
             stack=stack,
             mask=mask,
+            bleached_mask=bleached_mask,
+            unbleached_mask=unbleached_mask,
             measurement=ctx.measurement,
             fov=ctx.label,
             stack_dir=ctx.registered_stack_dir,
@@ -866,8 +980,12 @@ def main() -> None:
         min_bleach_percent=args.min_bleach_percent,
         imagej_distribution=args.imagej_distribution,
         default_group=args.default_group,
-        reuse_laser_roi=args.laser_roi,
-        laser_roi_path=(args.laser_roi or (args.output_root / "laser_roi.roi")).resolve(),
+        reuse_rois=args.reuse_rois,
+        crop_roi_path=(args.output_root / "crop.roi").resolve(),
+        bleached_roi_path=(args.output_root / "bleached.roi").resolve(),
+        unbleached_roi_path=(args.output_root / "unbleached.roi").resolve(),
+        bleached_mask_path=(args.output_root / "bleached_mask.tif").resolve(),
+        unbleached_mask_path=(args.output_root / "unbleached_mask.tif").resolve(),
         skip_registration=args.skip_registration,
         skip_cellpose=args.skip_cellpose,
         skip_measurement=args.skip_measurement,
@@ -888,13 +1006,23 @@ def main() -> None:
     logging.info("Discovered %d measurements.", len(measurements))
 
     ij = None
-    if not config.skip_registration or config.reuse_laser_roi is None:
+    # Initialize ImageJ if we need to register OR if we need to define ROIs (and they aren't reused)
+    if (not config.skip_registration) or (not config.reuse_rois):
         ij = init_imagej(config.imagej_distribution)
 
-    if config.reuse_laser_roi and config.reuse_laser_roi.exists():
-        config.laser_roi_path = config.reuse_laser_roi.resolve()
-        logging.info("Using existing ROI at %s", config.laser_roi_path)
+    # Check if ROIs exist if reuse is requested
+    rois_exist = (
+        config.crop_roi_path.exists()
+        and config.bleached_roi_path.exists()
+        and config.unbleached_roi_path.exists()
+        and config.bleached_mask_path.exists()
+        and config.unbleached_mask_path.exists()
+    )
+
+    if config.reuse_rois and rois_exist:
+        logging.info("Reusing existing ROIs and masks from %s", config.output_root)
     elif not config.skip_registration:
+        # Need to define ROIs using a sample stack
         roi_sample_dir = config.registered_root / "roi_temp"
         sample_found = False
         for sample_measurement in measurements:
@@ -907,7 +1035,7 @@ def main() -> None:
                         fov=sample_fov,
                         dest_dir=roi_sample_dir,
                     )
-                    prompt_for_laser_roi_from_stack(ij, roi_sample_dir, config)
+                    prompt_for_rois(ij, roi_sample_dir, config)
                     sample_found = True
                     break
                 except RuntimeError as exc:
@@ -927,8 +1055,9 @@ def main() -> None:
             raise RuntimeError(
                 "Unable to align any FOV for ROI definition; check image contrast or SIFT settings."
             )
-    else:
-        raise ValueError("Cannot skip registration without providing --laser-roi.")
+    elif not rois_exist:
+         # Skip registration but need ROIs -> Error
+        raise ValueError("Cannot skip registration without existing ROIs (use --reuse-rois and ensure files exist).")
 
     if not config.skip_registration:
         for measurement in measurements:
