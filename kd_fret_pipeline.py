@@ -22,9 +22,9 @@ Assumptions that are in line with the original workflow:
   align with the registered stacks (cells do not move after registration).
 * Donor/acceptor background values are user-provided for now (CLI arguments).
 * FRET metrics reuse the same frame windows as Plugins 5/8/9.
-* Each measurement can be annotated with IPTG induction concentrations every N
-  FOVs (default 20) so downstream Kd fits can be automated.
-  The last two FOVs of the FINAL measurement in the dataset are automatically labeled 'BLANK'.
+* IPTG concentrations advance every N FOVs (default 20) across the entire dataset
+  so downstream Kd fits can be automated. The last two FOVs of the FINAL
+  measurement in the dataset are automatically labeled 'BLANK'.
 
 Because the historical pipeline relied on several manual GUI steps, the script
 prompts the user exactly once to draw the laser ROI inside ImageJ; the saved
@@ -236,13 +236,13 @@ def parse_args() -> argparse.Namespace:
         type=float,
         nargs="+",
         required=True,
-        help="List of IPTG concentrations; each applies to a block of FOVs.",
+        help="List of IPTG concentrations consumed sequentially across all FOVs.",
     )
     parser.add_argument(
         "--fovs-per-iptg",
         type=int,
         default=20,
-        help="Number of FOVs that share the same IPTG concentration.",
+        help="Number of FOVs per concentration block (global order).",
     )
     parser.add_argument(
         "--run-id",
@@ -287,20 +287,27 @@ def ensure_dir(path: Path) -> Path:
 
 
 def iptg_for_fov(
-    index: int,
+    *,
+    local_index: int,
+    global_index: int,
     concentrations: Sequence[float],
     block_size: int,
-    total_fovs: int,
+    total_fovs_in_measurement: int,
     is_last_measurement: bool,
 ) -> Union[float, str]:
+    """Determine IPTG value for a FOV.
+
+    IPTG concentrations advance sequentially across the entire dataset (global_index),
+    but the BLANK logic still depends on the final measurement (local_index).
+    """
     # The last two FOVs of the LAST measurement are reserved as BLANK
-    if is_last_measurement and index > total_fovs - 2:
+    if is_last_measurement and local_index > total_fovs_in_measurement - 2:
         return "BLANK"
 
-    block = (index - 1) // block_size
+    block = (global_index - 1) // block_size
     if block < 0 or block >= len(concentrations):
         raise ValueError(
-            f"FOV index {index} (total {total_fovs}) exceeds provided IPTG blocks. "
+            f"Global FOV index {global_index} exceeds provided IPTG blocks. "
             f"Blocks available: {len(concentrations)} with size {block_size}."
         )
     return concentrations[block]
@@ -760,10 +767,13 @@ def build_fov_contexts(
     config: PipelineConfig,
 ) -> List[FovContext]:
     contexts: List[FovContext] = []
+    global_fov_index = 1
     num_measurements = len(measurements)
     for m_idx, measurement in enumerate(measurements):
         is_last_measurement = (m_idx == num_measurements - 1)
         for idx, fov in enumerate(measurement.fovs, start=1):
+            current_global_index = global_fov_index
+            global_fov_index += 1
             registered_dir = config.registered_root / measurement.name / fov
             try:
                 cellpose_frame, mask_path = extract_cellpose_frames(
@@ -783,11 +793,12 @@ def build_fov_contexts(
                 continue
             try:
                 iptg_value = iptg_for_fov(
-                    idx,
-                    config.iptg_concentrations,
-                    config.fovs_per_iptg,
-                    len(measurement.fovs),
-                    is_last_measurement,
+                    local_index=idx,
+                    global_index=current_global_index,
+                    concentrations=config.iptg_concentrations,
+                    block_size=config.fovs_per_iptg,
+                    total_fovs_in_measurement=len(measurement.fovs),
+                    is_last_measurement=is_last_measurement,
                 )
             except ValueError as exc:
                 raise ValueError(
