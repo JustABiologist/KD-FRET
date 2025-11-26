@@ -656,10 +656,15 @@ def compute_roi_timeseries(
             sl = slice(start - 1, end)
             return float(np.nanmean(mean_series[sl]))
 
-        don_bb = avg_range(26, 28)
-        don_ab = avg_range(29, 31)
-        acc_bb = avg_range(2, 3)
-        acc_ab = avg_range(54, 55)
+        # Corrected Frame Indices (1-based) based on Legacy Plugin logic:
+        # DonBB (Baseline): Frames 23-25 (was 26-28)
+        # DonAB (Signal):   Frames 26-28 (was 29-31)
+        # AccBB (Baseline): Frames 51-52 (was 2-3)
+        # AccAB (Bleached): Frames 53-54 (was 54-55)
+        don_bb = avg_range(23, 25)
+        don_ab = avg_range(26, 28)
+        acc_bb = avg_range(51, 52)
+        acc_ab = avg_range(53, 54)
 
         don_bb_bg = don_bb - bg_don
         don_ab_bg = don_ab - bg_don
