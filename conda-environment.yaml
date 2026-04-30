@@ -8,9 +8,12 @@ dependencies:
   - pandas>=2.1
   - cellpose>=3.0
   - scikit-image>=0.22
+  - tifffile>=2024.2
+  - openpyxl>=3.1
   - pip
   - pip:
       - typer>=0.12
+      - nd2>=0.10
       - pyimagej
-
+      - roifile>=2026.2.10
 

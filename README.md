@@ -16,13 +16,13 @@ Unified Python workflow that replicates the legacy KD-FRET processing chain writ
 ## Prerequisites
 
 1. **Conda environment**  
-   Create it once (Python 3.10) using the provided spec:
+   Create it once (Python 3.11) using the provided spec:
    ```bash
    conda env create -f conda-environment.yaml
    conda activate kd-fret
    ```
-   The environment already bundles `pyimagej`, `tifffile`, `openpyxl`, `cellpose`,
-   and the scientific stack.
+   The environment bundles `pyimagej`, `nd2`, `tifffile`, `openpyxl`, `cellpose`,
+   `roifile`, and the scientific stack.
 
 2. **ImageJ / Fiji**  
    - Default: `pyimagej` downloads a headless Fiji bundle automatically.
@@ -37,6 +37,8 @@ Unified Python workflow that replicates the legacy KD-FRET processing chain writ
 
 ## Running the pipeline
 
+### Legacy exported TIFF workflow
+
 ```bash
 python kd_fret_pipeline.py \
   --input-root /path/to/measurements \
@@ -48,6 +50,35 @@ python kd_fret_pipeline.py \
   --csv-decimal , \
   --results-xlsx /path/to/output/fret_results.xlsx
 ```
+
+### Raw ND2 multiplex workflow
+
+Use `kd_fret_multiplex.py` when each measurement is a subdirectory containing
+the five raw ND2 acquisition stacks. The `Seq` suffix defines the step:
+`Seq0000=donor_before`, `Seq0001=acceptor_before`, `Seq0002=laser`,
+`Seq0003=acceptor_after`, and `Seq0004=donor_after`. FOVs are inferred from the
+ND2 position axis, or from the total frame count divided by the expected frames
+per FOV when no position axis is present.
+
+```bash
+python kd_fret_multiplex.py \
+  --mode raw-nd2 \
+  --input-root /path/to/day \
+  --output-root /path/to/output \
+  --fovs-per-well-by-measurement 5 10 10 5 \
+  --measurement-labels-json '[["0uM","3uM","10uM","50uM"],["0uM","3uM"],["A","B","C"],["control","test"]]' \
+  --roi-mode prompt-ring \
+  --background-mode auto
+```
+
+Raw mode writes one workbook, `<output-root>/multiplex_results.xlsx`, with one
+sheet per measurement subdirectory. `--fovs-per-well-by-measurement` is one
+integer per sorted subdirectory; the pipeline infers the well count from
+`total FOVs / FOVs per well`. If labels are omitted, wells are named `Well01`,
+`Well02`, etc. ROI prompting opens one preview per measurement: draw the bleached
+area, and the pipeline uses the 100 px surrounding ring as the unbleached area.
+Use `--roi-mode prompt-two` to draw both bleached and unbleached areas manually,
+or `--roi-mode auto-laser` to infer the bleached area from the laser stack.
 
 Workflow summary:
 
