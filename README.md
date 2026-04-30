@@ -66,7 +66,6 @@ python kd_fret_multiplex.py \
   --input-root /path/to/day \
   --output-root /path/to/output \
   --fovs-per-well-by-measurement 5 10 10 5 \
-  --measurement-labels-json '[["0uM","3uM","10uM","50uM"],["0uM","3uM"],["A","B","C"],["control","test"]]' \
   --roi-mode prompt-ring \
   --background-mode auto
 ```
@@ -75,10 +74,13 @@ Raw mode writes one workbook, `<output-root>/multiplex_results.xlsx`, with one
 sheet per measurement subdirectory. `--fovs-per-well-by-measurement` is one
 integer per sorted subdirectory; the pipeline infers the well count from
 `total FOVs / FOVs per well`. If labels are omitted, wells are named `Well01`,
-`Well02`, etc. ROI prompting opens one preview per measurement: draw the bleached
-area, and the pipeline uses the 100 px surrounding ring as the unbleached area.
-Use `--roi-mode prompt-two` to draw both bleached and unbleached areas manually,
-or `--roi-mode auto-laser` to infer the bleached area from the laser stack.
+`Well02`, etc. Add `--measurement-labels-json` only when you want custom well or
+condition labels. ROI prompting opens one preview per measurement: draw the
+bleached area, and the pipeline uses the 100 px surrounding ring as the
+unbleached area. Use `--roi-mode prompt-two` to draw both bleached and
+unbleached areas manually, or `--roi-mode auto-laser` to infer the bleached area
+from the laser stack. The output rows include `BG_don`, `BG_acc`,
+`BG_pixel_count`, and `background_mode`.
 
 Workflow summary:
 
@@ -171,3 +173,12 @@ Every row in the CSV/XLSX corresponds to a single Cellpose ROI and contains:
 - **Missing Cellpose masks** – ensure you didn’t run with `--skip-cellpose` before the `_cp_masks.tif` files exist.
 
 For any other issue, re-run with `--log-level DEBUG` and check the console plus the ImageJ window output; the macros now print detailed status messages around registration, saving, and ROI handling.
+
+
+python kd_fret_multiplex.py \
+  --mode raw-nd2 \
+  --input-root /path/to/day \
+  --output-root /path/to/output \
+  --fovs-per-well-by-measurement 5 10 10 5 \
+  --roi-mode prompt-ring \
+  --background-mode auto

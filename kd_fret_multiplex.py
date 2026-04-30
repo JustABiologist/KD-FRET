@@ -1429,6 +1429,7 @@ def quantify_raw_job(job: RawFovJob, args: argparse.Namespace) -> pd.DataFrame:
                 "AccAB": acc_ab,
                 "BG_don": donor_bg,
                 "BG_acc": acceptor_bg,
+                "BG_pixel_count": int(bg_mask.sum()),
                 "DonBB_BG": don_bb_bg,
                 "DonAB_BG": don_ab_bg,
                 "AccBB_BG": acc_bb_bg,
