@@ -276,13 +276,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--acceptor-before-count",
         type=int,
-        default=18,
+        default=20,
         help="Raw ND2 acceptor frames before bleaching, taken from the first acceptor frames per FOV.",
     )
     parser.add_argument(
         "--acceptor-after-count",
         type=int,
-        default=16,
+        default=18,
         help="Raw ND2 acceptor frames after bleaching, taken from the last acceptor frames per FOV.",
     )
     parser.add_argument(

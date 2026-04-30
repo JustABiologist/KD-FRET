@@ -58,7 +58,9 @@ the five raw ND2 acquisition stacks. The `Seq` suffix defines the step:
 `Seq0000=donor_before`, `Seq0001=acceptor_before`, `Seq0002=laser`,
 `Seq0003=acceptor_after`, and `Seq0004=donor_after`. FOVs are inferred from the
 ND2 position axis, or from the total frame count divided by the expected frames
-per FOV when no position axis is present.
+per FOV when no position axis is present. The default raw frame counts are
+2 donor-before frames, 20 acceptor-before frames, 4 laser frames, 18
+acceptor-after frames, and 2 donor-after frames per FOV.
 
 ```bash
 python kd_fret_multiplex.py \
