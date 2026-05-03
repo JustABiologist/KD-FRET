@@ -1634,8 +1634,9 @@ def build_raw_jobs_python_crop(args: argparse.Namespace) -> List[RawFovJob]:
 def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
     """
     TIFF-multiplex parity: write flat virtual TIFF sequences under nd2_ij_source/,
-    run SIFT alignment + laser ROI once per measurement, register_and_crop into
-    01_registered/, then stage Cellpose frames from cropped stacks.
+    align + define the laser ROI once globally (first successful measurement, like
+    legacy TIFF main), then register_and_crop every FOV of every measurement with
+    that same ROI, and stage Cellpose frames from cropped stacks.
     """
     cellpose_dir = ensure_dir(args.output_root / "02_cellpose_raw_input")
     scratch_ij = ensure_dir(args.output_root / "nd2_ij_source")
@@ -1644,7 +1645,89 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
     measurement_labels = load_nested_cli_list(args.measurement_labels_json, "--measurement-labels-json")
     jobs: List[RawFovJob] = []
 
-    ij = None
+    ensure_dir(args.output_root / "01_registered")
+    ensure_dir(args.output_root / "01_registered_bleached")
+    ensure_dir(args.output_root / "01_registered_unbleached")
+
+    ij: Optional[imagej.ImageJ] = None
+    seed_cfg = nd2_ij_pipeline_config(args)
+
+    if args.laser_roi is not None and args.laser_roi.exists():
+        shared_laser_roi_path = args.laser_roi.resolve()
+        logging.info("Using existing laser ROI for all ND2 measurements: %s", shared_laser_roi_path)
+    else:
+        roi_sample_dir = args.output_root / "nd2_ij_roi_temp"
+        sample_found = False
+        for measurement_index, (measurement_name, measurement_dir) in enumerate(measurement_dirs):
+            role_files = parse_raw_nd2_files(measurement_dir, args)
+            if not role_files:
+                continue
+            safe_measurement = re.sub(r"[^A-Za-z0-9_.-]+", "_", measurement_name)
+            missing_roles = [
+                role
+                for role in ("donor_before", "donor_after", "acceptor_before", "acceptor_after", "laser")
+                if role not in role_files
+            ]
+            if missing_roles:
+                raise ValueError(
+                    f"{measurement_name}: missing ND2 roles for SIFT composite: {', '.join(missing_roles)}. "
+                    "Laboratory standard: five files Seq0000..Seq0004 (laser is Seq0002)."
+                )
+            if args.laser_count <= 0:
+                raise ValueError(
+                    f"{measurement_name}: raw ND2 SIFT composites require --laser-count >= 1 (laser ND2)."
+                )
+            position_count = infer_position_count(role_files, args)
+            fov_disp_list = [fov_label_for_position(i, args, fov_map) for i in range(position_count)]
+            ij_tags = [fov_ij_filter_tag(f) for f in fov_disp_list]
+            if len(set(ij_tags)) != len(ij_tags):
+                raise ValueError(
+                    f"{measurement_name}: FOV labels map to duplicate ImageJ tags {ij_tags}. "
+                    "Adjust numbering or pass distinct --fov-labels entries."
+                )
+
+            if ij is None:
+                ij = init_imagej(args.imagej_distribution)
+
+            try:
+                ij_meas_flat = ensure_dir(scratch_ij / safe_measurement)
+                for position_index in range(position_count):
+                    materialize_nd2_fov_ij_stack(
+                        role_files,
+                        position_index,
+                        ij_meas_flat,
+                        ij_tags[position_index],
+                        args,
+                    )
+                measurement = nd2_ij_measurement(scratch_ij, safe_measurement, ij_tags)
+                first_tag = measurement.fovs[0]
+                align_stack_only(
+                    ij=ij,
+                    measurement=measurement,
+                    config=seed_cfg,
+                    fov=first_tag,
+                    dest_dir=roi_sample_dir,
+                )
+                prompt_for_laser_roi_from_stack(ij, roi_sample_dir, seed_cfg)
+                shared_laser_roi_path = seed_cfg.laser_roi_path.resolve()
+                sample_found = True
+                break
+            except RuntimeError as exc:
+                logging.warning(
+                    "Skipping %s for global laser ROI setup: %s",
+                    measurement_name,
+                    exc,
+                )
+            finally:
+                if roi_sample_dir.exists():
+                    shutil.rmtree(roi_sample_dir, ignore_errors=True)
+
+        if not sample_found:
+            raise RuntimeError(
+                "Unable to align any ND2 measurement for global laser ROI definition; "
+                "check image contrast, SIFT settings, or pass --laser-roi."
+            )
+        logging.info("Saved global laser ROI for all measurements to %s", shared_laser_roi_path)
 
     for measurement_index, (measurement_name, measurement_dir) in enumerate(measurement_dirs):
         role_files = parse_raw_nd2_files(measurement_dir, args)
@@ -1693,10 +1776,6 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
                 "Adjust numbering or pass distinct --fov-labels entries."
             )
 
-        ensure_dir(args.output_root / "01_registered")
-        ensure_dir(args.output_root / "01_registered_bleached")
-        ensure_dir(args.output_root / "01_registered_unbleached")
-
         for position_index in range(position_count):
             materialize_nd2_fov_ij_stack(
                 role_files,
@@ -1708,21 +1787,7 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
 
         measurement = nd2_ij_measurement(scratch_ij, safe_measurement, ij_tags)
         ij_cfg = nd2_ij_pipeline_config(args)
-
-        if args.laser_roi is not None and args.laser_roi.exists():
-            ij_cfg.laser_roi_path = args.laser_roi.resolve()
-            logging.info("%s: reusing laser ROI from %s", measurement_name, ij_cfg.laser_roi_path)
-        else:
-            roi_sample_dir = ensure_dir(args.output_root / "nd2_ij_roi_sample" / safe_measurement)
-            first_tag = measurement.fovs[0]
-            align_stack_only(
-                ij=ij,
-                measurement=measurement,
-                config=ij_cfg,
-                fov=first_tag,
-                dest_dir=roi_sample_dir,
-            )
-            prompt_for_laser_roi_from_stack(ij, roi_sample_dir, ij_cfg)
+        ij_cfg.laser_roi_path = shared_laser_roi_path
 
         for fov_tag in measurement.fovs:
             register_and_crop(ij, measurement, ij_cfg, fov_tag)

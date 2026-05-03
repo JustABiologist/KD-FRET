@@ -68,10 +68,10 @@ acceptor-after frames, and 2 donor-after frames per FOV.
 **`kd_fret_multiplex_claude.py` — SIFT vs Python ROI:**  
 With `--nd2-alignment sift` (default), the script writes a flat virtual TIFF
 multiplex under `<output-root>/nd2_ij_source/`, runs Fiji linear stack alignment
-(SIFT) + one laser ROI per measurement (same pattern as the legacy TIFF
-workflow), then `register_and_crop` outputs under `01_registered/`. Cellpose and
-quantification read those cropped, aligned stacks. This path needs **pyimagej /
-Fiji**. Use `--nd2-alignment none` to keep the older Python ROI crop before
+(SIFT) + **one global laser ROI** for the whole run (first ND2 measurement whose
+sample stack aligns, same idea as legacy TIFF), then `register_and_crop` outputs
+under `01_registered/`. Pass `--laser-roi` to skip the prompt and reuse a file.
+Cellpose and quantification read those cropped, aligned stacks. This path needs **pyimagej/Fiji**. Use `--nd2-alignment none` to keep the older Python ROI crop before
 Cellpose; `--roi-mode` applies only in that mode. `--nd2-align-frame-start`
 mirrors which slice ImageJ uses as the first frame of the opened sequence
 (aligned with partition math when loading registered stacks). Do not combine
