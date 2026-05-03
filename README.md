@@ -53,14 +53,29 @@ python kd_fret_pipeline.py \
 
 ### Raw ND2 multiplex workflow
 
-Use `kd_fret_multiplex.py` when each measurement is a subdirectory containing
-the five raw ND2 acquisition stacks. The `Seq` suffix defines the step:
+Use `kd_fret_multiplex.py` (or `kd_fret_multiplex_claude.py` for the extended
+variant) when each measurement is a subdirectory containing the five raw ND2
+acquisition stacks. **Role assignment is by the trailing `Seq` digit only**
+(`Seq0000`–`Seq0004`); channel substrings in the filename are for logging, not
+for deciding which file is donor/acceptor/laser. Map:
 `Seq0000=donor_before`, `Seq0001=acceptor_before`, `Seq0002=laser`,
-`Seq0003=acceptor_after`, and `Seq0004=donor_after`. FOVs are inferred from the
-ND2 position axis, or from the total frame count divided by the expected frames
-per FOV when no position axis is present. The default raw frame counts are
-2 donor-before frames, 20 acceptor-before frames, 4 laser frames, 18
+`Seq0003=acceptor_after`, `Seq0004=donor_after`. FOVs are inferred from the ND2
+position axis, or from the total frame count divided by the expected frames per
+FOV when no position axis is present. The default raw frame counts are 2
+donor-before frames, 20 acceptor-before frames, 4 laser frames, 18
 acceptor-after frames, and 2 donor-after frames per FOV.
+
+**`kd_fret_multiplex_claude.py` — SIFT vs Python ROI:**  
+With `--nd2-alignment sift` (default), the script writes a flat virtual TIFF
+multiplex under `<output-root>/nd2_ij_source/`, runs Fiji linear stack alignment
+(SIFT) + one laser ROI per measurement (same pattern as the legacy TIFF
+workflow), then `register_and_crop` outputs under `01_registered/`. Cellpose and
+quantification read those cropped, aligned stacks. This path needs **pyimagej /
+Fiji**. Use `--nd2-alignment none` to keep the older Python ROI crop before
+Cellpose; `--roi-mode` applies only in that mode. `--nd2-align-frame-start`
+mirrors which slice ImageJ uses as the first frame of the opened sequence
+(aligned with partition math when loading registered stacks). Do not combine
+`--nd2-alignment sift` with `--skip-registration`.
 
 ```bash
 python kd_fret_multiplex.py \
@@ -175,6 +190,3 @@ Every row in the CSV/XLSX corresponds to a single Cellpose ROI and contains:
 - **Missing Cellpose masks** – ensure you didn’t run with `--skip-cellpose` before the `_cp_masks.tif` files exist.
 
 For any other issue, re-run with `--log-level DEBUG` and check the console plus the ImageJ window output; the macros now print detailed status messages around registration, saving, and ROI handling.
-
-
-python kd_fret_multiplex.py --mode raw-nd2 --input-root /path/to/day --output-root /path/to/output --fovs-per-well-by-measurement 5 10 10 5 --roi-mode prompt-ring --background-mode auto

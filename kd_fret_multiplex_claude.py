@@ -8,19 +8,17 @@ files named like:
 
     YYYYMMDD_HHMMSS_001_<channelname>_Seq0000.nd2
 
-The raw workflow maps Seq0000..Seq0004 to the acquisition steps, groups files by
-measurement folder and ND2 position label,
-creates Cellpose inputs, quantifies cells in the bleached mask and the 100 px
-surrounding unbleached ring, and writes one workbook with one sheet per
-measurement folder.
+The trailing Seq digit maps roles (Seq0000–Seq0004) only via SEQ_ROLE_MAP; channel
+aliases are not used when Seq is present (see parse_raw_nd2_files).
 
-CHANGE vs original: In raw ND2 mode the bleach + ring ROI is now computed ONCE
-per measurement BEFORE Cellpose runs.  The donor_pre_mean image saved for Cellpose
-is cropped to the bounding box of that ROI (plus a small padding).  During
-quantification the resulting cropped mask is expanded back to full-image
-coordinates so all downstream overlap calculations remain correct.
-This can reduce the area fed to Cellpose by 60-90 % on a typical setup, giving
-a large speed-up on CPU-only machines.
+Raw ND2 default (`--nd2-alignment sift`): virtual TIFF stacks are written per FOV,
+ImageJ aligns them with Linear Stack Alignment (SIFT), the user draws a single
+global laser ROI (post-bleach frame, same heuristic as multiplex TIFF),
+`register_and_crop` applies buffered crop outputs under `01_registered/`, Cellpose
+and quantify_raw_job consume those cropped stacks unchanged.
+
+Alternative (`--nd2-alignment none`): legacy behaviour—Python ROI cropping before
+Cellpose and mask expansion during quantification.
 """
 
 from __future__ import annotations
@@ -135,10 +133,9 @@ class RawFovJob:
     cellpose_frame_path: Path
     cellpose_mask_path: Path
     # NEW: bounding box (row_start, col_start, row_end, col_end) in full-image
-    # pixel coordinates used to crop the Cellpose input.  None means the full
-    # image was saved (ROI could not be precomputed for this measurement).
+    # coordinates when alignment is Python-cropped (alignment none).
     crop_rect: Optional[Tuple[int, int, int, int]] = None
-
+    registered_stack_dir: Optional[Path] = None
 
 # --------------------------------------------------------------------------------------
 # CLI parsing helpers
@@ -335,8 +332,26 @@ def parse_args() -> argparse.Namespace:
         choices=["prompt-ring", "prompt-two", "auto-laser"],
         default="prompt-ring",
         help=(
-            "Raw ND2 ROI mode: prompt bleached ROI and generate a 100 px ring, prompt bleached "
-            "and unbleached ROIs, or infer the bleached ROI from the laser stack."
+            "Raw ND2 ROI mode when --nd2-alignment none only: bleached ROI + ring, "
+            "two prompts, or laser-derived bleach mask."
+        ),
+    )
+    parser.add_argument(
+        "--nd2-alignment",
+        choices=["sift", "none"],
+        default="sift",
+        help=(
+            "Raw ND2: sift uses ImageJ SIFT + multiplex register_and_crop parity; "
+            "none preserves Python cropping before Cellpose."
+        ),
+    )
+    parser.add_argument(
+        "--nd2-align-frame-start",
+        type=int,
+        default=1,
+        help=(
+            "Raw ND2 SIFT: 1-based first TIFF index passed to File.openSequence for alignment/crop "
+            "(use 1 to keep all concatenated ND2 planes in composite stacks)."
         ),
     )
     parser.add_argument(
@@ -606,6 +621,15 @@ SEQ_ROLE_MAP: Mapping[int, str] = {
     4: "donor_after",
 }
 
+# Composite stack order matching Seq0000..Seq0004 for ImageJ alignment + partitioning.
+ND2_IJ_ROLE_ORDER: Tuple[str, ...] = (
+    "donor_before",
+    "acceptor_before",
+    "laser",
+    "acceptor_after",
+    "donor_after",
+)
+
 
 def normalize_token(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).lower())
@@ -633,8 +657,6 @@ def infer_channel_role(channel_name: str, args: argparse.Namespace) -> Optional[
 def expand_before_after_roles(files: Sequence[RawNd2File], args: argparse.Namespace) -> Dict[str, RawNd2File]:
     sorted_files = sorted(files, key=lambda item: (item.seq, item.path.name))
     role_files: Dict[str, RawNd2File] = {}
-    donor_pending: List[RawNd2File] = []
-    acceptor_pending: List[RawNd2File] = []
 
     for frame_file in sorted_files:
         seq_role = SEQ_ROLE_MAP.get(frame_file.seq)
@@ -652,10 +674,20 @@ def expand_before_after_roles(files: Sequence[RawNd2File], args: argparse.Namesp
     if set(SEQ_ROLE_MAP.values()).issubset(role_files):
         return role_files
 
+    donor_pending: List[RawNd2File] = []
+    acceptor_pending: List[RawNd2File] = []
+
     for frame_file in sorted_files:
+        if SEQ_ROLE_MAP.get(frame_file.seq) is not None:
+            continue
         if frame_file.role in {"donor_before", "donor_after", "acceptor_before", "acceptor_after", "laser"}:
             if frame_file.role in role_files:
-                logging.warning("Duplicate role %s: keeping %s, ignoring %s", frame_file.role, role_files[frame_file.role].path, frame_file.path)
+                logging.warning(
+                    "Duplicate role %s (non-Seq): keeping %s, ignoring %s",
+                    frame_file.role,
+                    role_files[frame_file.role].path,
+                    frame_file.path,
+                )
             else:
                 role_files[frame_file.role] = frame_file
         elif frame_file.role == "donor":
@@ -702,17 +734,38 @@ def parse_raw_nd2_files(
 
         raw_channel = match.group("channel").strip()
         channel = re.sub(r"\s+", " ", raw_channel).strip("_ ").strip()
-        role = infer_channel_role(channel, args)
-        if role is None:
-            role = "unknown"
+        seq_digit = int(match.group("seq"))
+        hinted = infer_channel_role(channel, args)
+        canonical = SEQ_ROLE_MAP.get(seq_digit)
+        assigned = canonical if canonical is not None else (hinted if hinted is not None else "unknown")
+        if (
+            canonical is not None
+            and hinted
+            and hinted != canonical
+            and hinted
+            in {
+                "donor_before",
+                "donor_after",
+                "acceptor_before",
+                "acceptor_after",
+                "laser",
+            }
+        ):
+            logging.warning(
+                "ND2 %s: channel alias suggests role %s but Seq%04d maps to %s — using Seq role.",
+                path.name,
+                hinted,
+                seq_digit,
+                canonical,
+            )
 
         frame = RawNd2File(
             path=path,
             timestamp=match.group("timestamp"),
             token=match.group("token"),
             channel=channel,
-            role=role,
-            seq=int(match.group("seq")),
+            role=str(assigned),
+            seq=seq_digit,
         )
         files.append(frame)
 
@@ -1289,6 +1342,148 @@ def infer_position_count(role_files: Mapping[str, RawNd2File], args: argparse.Na
     return inferred[0]
 
 
+def fov_ij_filter_tag(fov_label: str) -> str:
+    """
+    Normalize a lab/ND2 metadata FOV label into ``xyNN`` for ImageJ
+    ``File.openSequence(..., filter=xyNN)`` on a flat virtual TIFF folder.
+    """
+    raw = str(fov_label).strip()
+    if not raw:
+        raise ValueError("Empty FOV label cannot be mapped to an ImageJ xy tag.")
+    lower = raw.lower()
+    xy_m = re.fullmatch(r"xy(\d{1,6})", lower, flags=re.I)
+    if xy_m:
+        return f"xy{int(xy_m.group(1)):02d}"
+    pos_m = re.fullmatch(r"pos(\d{1,6})", lower, flags=re.I)
+    if pos_m:
+        return f"xy{int(pos_m.group(1)):02d}"
+    digits = re.sub(r"\D", "", raw)
+    if digits:
+        return f"xy{int(digits):02d}"
+    raise ValueError(f"Cannot derive xyNN ImageJ tag from FOV label {raw!r}")
+
+
+def nd2_ij_measurement(scratch_root: Path, measurement_safe: str, fov_ij_tags: Sequence[str]) -> Measurement:
+    return Measurement(
+        name=measurement_safe,
+        source_dir=(scratch_root / measurement_safe).resolve(),
+        group="IN",
+        index=1,
+        fovs=list(fov_ij_tags),
+    )
+
+
+def nd2_ij_pipeline_config(args: argparse.Namespace) -> PipelineConfig:
+    roi_candidate = args.laser_roi if args.laser_roi else args.output_root / "laser_roi.roi"
+    bd = args.background_donor if args.background_donor is not None else 0.0
+    ba = args.background_acceptor if args.background_acceptor is not None else 0.0
+    cellpose_parent = args.output_root / "02_cellpose_raw_input"
+    return PipelineConfig(
+        input_root=args.input_root.resolve(),
+        output_root=args.output_root.resolve(),
+        registered_root=(args.output_root / "01_registered").resolve(),
+        registered_bleached_root=(args.output_root / "01_registered_bleached").resolve(),
+        registered_unbleached_root=(args.output_root / "01_registered_unbleached").resolve(),
+        cellpose_input=cellpose_parent.resolve(),
+        backgrounds=(bd, ba),
+        sequence_start=max(1, int(args.nd2_align_frame_start)),
+        cellpose_frame_index=args.cellpose_frame_index,
+        min_quality_ratio=args.min_quality_ratio,
+        min_bleach_percent=args.min_bleach_percent,
+        imagej_distribution=args.imagej_distribution,
+        default_group=args.default_group,
+        reuse_laser_roi=args.laser_roi,
+        laser_roi_path=roi_candidate.resolve(),
+        skip_registration=False,
+        skip_cellpose=True,
+        skip_measurement=True,
+        cellpose_model=args.cellpose_model,
+        cellpose_diameter=args.cellpose_diameter,
+        cellpose_channels=tuple(args.cellpose_channels),
+        iptg_concentrations=None,
+        fovs_per_iptg=args.fovs_per_iptg,
+        run_id=args.run_id,
+        csv_decimal=args.csv_decimal,
+        multiplex=True,
+    )
+
+
+def materialize_nd2_fov_ij_stack(
+    role_files: Mapping[str, RawNd2File],
+    position_index: int,
+    dest_measurement_dir: Path,
+    ij_tag: str,
+    args: argparse.Namespace,
+) -> int:
+    """
+    Write ``{ij_tag}use####.tif`` frames into one flat measurement directory (multiplex TIFF layout).
+
+    Multiple FOVs share *dest_measurement_dir*; filenames are distinguished by ``ij_tag``.
+    """
+    counts = raw_role_frame_counts(args)
+    dest_measurement_dir.mkdir(parents=True, exist_ok=True)
+    planes: List[np.ndarray] = []
+    for role in ND2_IJ_ROLE_ORDER:
+        raw_nd2 = role_files[role]
+        stk = trim_stack(
+            read_nd2_position_stack(raw_nd2.path, position_index, counts[role]),
+            counts[role],
+            role,
+            f"idx{position_index}",
+        )
+        for zi in range(stk.shape[0]):
+            planes.append(stk[zi])
+    for idx, pl in enumerate(planes, start=1):
+        tifffile.imwrite(dest_measurement_dir / f"{ij_tag}use{idx:04d}.tif", pl.astype(np.float32, copy=False))
+    return len(planes)
+
+
+def split_registered_stack_into_roles(
+    stack: np.ndarray,
+    args: argparse.Namespace,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Dict[str, int]]:
+    counts = raw_role_frame_counts(args)
+    seq_start_onebased = max(1, int(args.nd2_align_frame_start))
+    rg0 = seq_start_onebased - 1
+    glob_hi = rg0 + int(stack.shape[0])
+    off = 0
+
+    pieces: Dict[str, np.ndarray] = {}
+    for role in ND2_IJ_ROLE_ORDER:
+        lo_g = off
+        hi_g = off + counts[role]
+        off = hi_g
+        lo_adj = max(lo_g, rg0)
+        hi_adj = min(hi_g, glob_hi)
+        if hi_adj <= lo_adj:
+            raise ValueError(
+                f"Registered composite has no planes for '{role}' after align start {seq_start_onebased}: "
+                f"global [{lo_g}, {hi_g}) vs retained [{rg0}, {glob_hi}). "
+                "Reduce --nd2-align-frame-start to 1 to keep all concatenated ND2 frames."
+            )
+        chunk = stack[lo_adj - rg0 : hi_adj - rg0].copy()
+        if chunk.shape[0] != counts[role]:
+            raise ValueError(
+                f"Expected {counts[role]} frames for '{role}' from registered composite, "
+                f"got {chunk.shape[0]} (wrong --sequence-start alignment vs composite length?)."
+            )
+        pieces[role] = chunk
+
+    donor_before = pieces["donor_before"]
+    donor_after = pieces["donor_after"]
+    acc_before = pieces["acceptor_before"]
+    acc_after = pieces["acceptor_after"]
+    laser_stack_p = pieces.get("laser")
+    cnt = {
+        "donor_before_n": donor_before.shape[0],
+        "donor_after_n": donor_after.shape[0],
+        "acceptor_before_n": acc_before.shape[0],
+        "acceptor_after_n": acc_after.shape[0],
+        "laser_n": 0 if laser_stack_p is None else int(laser_stack_p.shape[0]),
+    }
+    return donor_before, donor_after, acc_before, acc_after, laser_stack_p, cnt
+
+
 def fov_label_for_position(position_index: int, args: argparse.Namespace, fov_map: Mapping[str, Mapping[str, str]]) -> str:
     if args.fov_labels and position_index < len(args.fov_labels):
         return str(args.fov_labels[position_index])
@@ -1322,6 +1517,12 @@ def fovs_per_well_for_measurement(
 
 
 def build_raw_jobs(args: argparse.Namespace) -> List[RawFovJob]:
+    if getattr(args, "nd2_alignment", "sift") == "sift":
+        return build_raw_jobs_sift(args)
+    return build_raw_jobs_python_crop(args)
+
+
+def build_raw_jobs_python_crop(args: argparse.Namespace) -> List[RawFovJob]:
     """
     Discover all ND2 measurement directories, optionally prompt the user for
     ROI definitions (once per measurement), crop Cellpose input frames to the
@@ -1352,7 +1553,7 @@ def build_raw_jobs(args: argparse.Namespace) -> List[RawFovJob]:
         if missing_roles:
             raise ValueError(
                 f"{measurement_name}: missing required ND2 roles: {', '.join(missing_roles)}. "
-                "Use channel names or --role-order to disambiguate the five files."
+                "Use Seq0000..Seq0004 filenames or legacy --role-order."
             )
         if "laser" not in role_files and args.roi_mode == "auto-laser":
             raise ValueError(f"{measurement_name}: --roi-mode auto-laser requires a laser ND2 file.")
@@ -1419,6 +1620,7 @@ def build_raw_jobs(args: argparse.Namespace) -> List[RawFovJob]:
                 cellpose_frame_path=frame_path,
                 cellpose_mask_path=mask_path,
                 crop_rect=crop_rect,  # NEW: stored so quantify_raw_job can expand the mask
+                registered_stack_dir=None,
             )
             # CHANGED: pass crop_rect so the frame is saved already cropped
             make_cellpose_input(job, args, crop_rect=crop_rect)
@@ -1426,6 +1628,163 @@ def build_raw_jobs(args: argparse.Namespace) -> List[RawFovJob]:
 
     if not jobs:
         raise RuntimeError("No raw ND2 FOV jobs were prepared.")
+    return jobs
+
+
+def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
+    """
+    TIFF-multiplex parity: write flat virtual TIFF sequences under nd2_ij_source/,
+    run SIFT alignment + laser ROI once per measurement, register_and_crop into
+    01_registered/, then stage Cellpose frames from cropped stacks.
+    """
+    cellpose_dir = ensure_dir(args.output_root / "02_cellpose_raw_input")
+    scratch_ij = ensure_dir(args.output_root / "nd2_ij_source")
+    fov_map = load_fov_map(args.fov_map)
+    measurement_dirs = discover_raw_measurement_dirs(args.input_root)
+    measurement_labels = load_nested_cli_list(args.measurement_labels_json, "--measurement-labels-json")
+    jobs: List[RawFovJob] = []
+
+    ij = None
+
+    for measurement_index, (measurement_name, measurement_dir) in enumerate(measurement_dirs):
+        role_files = parse_raw_nd2_files(measurement_dir, args)
+        if not role_files:
+            logging.warning("No usable ND2 files found in %s", measurement_dir)
+            continue
+
+        if ij is None:
+            ij = init_imagej(args.imagej_distribution)
+        safe_measurement = re.sub(r"[^A-Za-z0-9_.-]+", "_", measurement_name)
+        missing_roles = [
+            role
+            for role in ("donor_before", "donor_after", "acceptor_before", "acceptor_after", "laser")
+            if role not in role_files
+        ]
+        if missing_roles:
+            raise ValueError(
+                f"{measurement_name}: missing ND2 roles for SIFT composite: {', '.join(missing_roles)}. "
+                "Laboratory standard: five files Seq0000..Seq0004 (laser is Seq0002)."
+            )
+        if args.laser_count <= 0:
+            raise ValueError(
+                f"{measurement_name}: raw ND2 SIFT composites require --laser-count >= 1 (laser ND2)."
+            )
+
+        position_count = infer_position_count(role_files, args)
+        fovs_per_well = fovs_per_well_for_measurement(
+            args.fovs_per_well_by_measurement,
+            measurement_index,
+            len(measurement_dirs),
+            args.fovs_per_well,
+        )
+        labels_for_measurement = select_measurement_spec(
+            measurement_labels,
+            measurement_index,
+            len(measurement_dirs),
+            "--measurement-labels-json",
+        )
+
+        ij_meas_flat = ensure_dir(scratch_ij / safe_measurement)
+        fov_disp_list = [fov_label_for_position(i, args, fov_map) for i in range(position_count)]
+        ij_tags = [fov_ij_filter_tag(f) for f in fov_disp_list]
+        if len(set(ij_tags)) != len(ij_tags):
+            raise ValueError(
+                f"{measurement_name}: FOV labels map to duplicate ImageJ tags {ij_tags}. "
+                "Adjust numbering or pass distinct --fov-labels entries."
+            )
+
+        ensure_dir(args.output_root / "01_registered")
+        ensure_dir(args.output_root / "01_registered_bleached")
+        ensure_dir(args.output_root / "01_registered_unbleached")
+
+        for position_index in range(position_count):
+            materialize_nd2_fov_ij_stack(
+                role_files,
+                position_index,
+                ij_meas_flat,
+                ij_tags[position_index],
+                args,
+            )
+
+        measurement = nd2_ij_measurement(scratch_ij, safe_measurement, ij_tags)
+        ij_cfg = nd2_ij_pipeline_config(args)
+
+        if args.laser_roi is not None and args.laser_roi.exists():
+            ij_cfg.laser_roi_path = args.laser_roi.resolve()
+            logging.info("%s: reusing laser ROI from %s", measurement_name, ij_cfg.laser_roi_path)
+        else:
+            roi_sample_dir = ensure_dir(args.output_root / "nd2_ij_roi_sample" / safe_measurement)
+            first_tag = measurement.fovs[0]
+            align_stack_only(
+                ij=ij,
+                measurement=measurement,
+                config=ij_cfg,
+                fov=first_tag,
+                dest_dir=roi_sample_dir,
+            )
+            prompt_for_laser_roi_from_stack(ij, roi_sample_dir, ij_cfg)
+
+        for fov_tag in measurement.fovs:
+            register_and_crop(ij, measurement, ij_cfg, fov_tag)
+
+        cfg_frame_index = ij_cfg.cellpose_frame_index
+
+        for position_index in range(position_count):
+            fov_disp = fov_disp_list[position_index]
+            fov_tag = ij_tags[position_index]
+            registered_dir = (ij_cfg.registered_root / measurement.name / fov_tag).resolve()
+            well_index, well, iptg_label, condition = metadata_for_measurement_position(
+                fov=fov_disp,
+                position_number=position_index + 1,
+                position_count=position_count,
+                fov_map=fov_map,
+                fovs_per_well=fovs_per_well,
+                labels=labels_for_measurement,
+            )
+            seq_files = stack_frame_files(registered_dir)
+            if not seq_files:
+                raise FileNotFoundError(
+                    f"{measurement_name} FOV {fov_disp}: no registered TIFF planes in {registered_dir}"
+                )
+            if cfg_frame_index < 1 or cfg_frame_index > len(seq_files):
+                raise ValueError(
+                    f"{measurement_name} FOV {fov_disp}: cellpose_frame_index "
+                    f"{cfg_frame_index} outside [1, {len(seq_files)}] for {registered_dir}"
+                )
+            frame_path = cellpose_dir / f"{safe_measurement}_{fov_disp}_donor_pre_mean.tif"
+            mask_path = frame_path.with_name(frame_path.stem + "_cp_masks.tif")
+            shutil.copyfile(seq_files[cfg_frame_index - 1], frame_path)
+
+            job = RawFovJob(
+                measurement_name=measurement_name,
+                measurement_dir=measurement_dir,
+                position_index=position_index,
+                fov=fov_disp,
+                well_index=well_index,
+                well=well,
+                iptg_label=iptg_label,
+                condition=condition,
+                role_files=role_files,
+                cellpose_frame_path=frame_path,
+                cellpose_mask_path=mask_path,
+                crop_rect=None,
+                registered_stack_dir=registered_dir,
+            )
+            jobs.append(job)
+
+    if not jobs:
+        raise RuntimeError("No raw ND2 FOV jobs were prepared (SIFT path).")
+
+    if ij is None:  # pragma: no cover - defensive; loop would yield jobs otherwise
+        raise RuntimeError(
+            "SIFT multiplex path yielded no Fiji work (no ND2 measurements with five Seq roles?)."
+        )
+
+    logging.info(
+        "ND2 SIFT multiplex: virtual TIFF multiplex under %s; registered cropped stacks under %s.",
+        scratch_ij,
+        args.output_root / "01_registered",
+    )
     return jobs
 
 
@@ -1492,6 +1851,28 @@ def make_region_masks(
     If the cache is cold (e.g. --skip-cellpose rerun without rerunning
     build_raw_jobs), it falls back to on-demand computation as before.
     """
+    mask_sidecar = (
+        job.registered_stack_dir / "bleach_roi_mask.tif"
+        if job.registered_stack_dir is not None
+        else None
+    )
+    if mask_sidecar is not None and mask_sidecar.exists():
+        mask_raw = np.asarray(tifffile.imread(mask_sidecar))
+        bleach_mask = np.squeeze(mask_raw) > 0
+        if bleach_mask.shape != image_shape:
+            raise ValueError(
+                f"{job.measurement_name} {job.fov}: bleach_roi_mask.tif shape {bleach_mask.shape} "
+                f"!= registered stack plane shape {image_shape}"
+            )
+        ring_mask = (
+            morphology.binary_dilation(
+                bleach_mask,
+                morphology.disk(max(1, int(args.roi_buffer_px))),
+            )
+            & ~bleach_mask
+        )
+        return bleach_mask, ring_mask
+
     cache_key = (job.measurement_name, image_shape, args.roi_mode)
     if cache_key in RAW_ROI_CACHE:
         return RAW_ROI_CACHE[cache_key]
@@ -1596,10 +1977,26 @@ def classify_cell_area(
     return "Outside", bleach_fraction, ring_fraction
 
 
+def load_registered_composite_stack(registered_stack_dir: Path) -> np.ndarray:
+    """Load every ``*useNNNN.tif`` plane from ``register_and_crop`` output (cropped coords)."""
+    seq_files = stack_frame_files(registered_stack_dir)
+    if not seq_files:
+        raise FileNotFoundError(f"No registered TIFF sequence frames in {registered_stack_dir}")
+    planes: List[np.ndarray] = [
+        np.asarray(tifffile.imread(path), dtype=np.float32)
+        for path in seq_files
+    ]
+    return np.stack(planes, axis=0)
+
+
 def load_raw_quant_stacks(
     job: RawFovJob,
     args: argparse.Namespace,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Dict[str, int]]:
+    if job.registered_stack_dir is not None:
+        stack = load_registered_composite_stack(job.registered_stack_dir)
+        return split_registered_stack_into_roles(stack, args)
+
     donor_before = trim_stack(
         read_nd2_position_stack(job.role_files["donor_before"].path, job.position_index, args.donor_before_count),
         args.donor_before_count,
@@ -1652,9 +2049,9 @@ def quantify_raw_job(job: RawFovJob, args: argparse.Namespace) -> pd.DataFrame:
     All downstream overlap, background, and FRET calculations then operate on
     full-size arrays, so no other code needed to change.
     """
-    # 1. Load full-resolution quantification stacks to get the canonical shape.
+    # 1. Load stacks in quantification coordinates (full uncropped ND2, or cropped registered TIFF).
     donor_before, donor_after, acc_before, acc_after, laser_stack, counts = load_raw_quant_stacks(job, args)
-    image_shape = donor_before.shape[1:]   # (H, W) — full-resolution
+    image_shape = donor_before.shape[1:]   # (H, W): full ND2 FoV or cropped registered stack
 
     # 2. Load Cellpose mask and expand it if the input was cropped.
     mask = load_mask(job.cellpose_mask_path)
@@ -1850,6 +2247,11 @@ def save_raw_workbook(results_by_measurement: Mapping[str, pd.DataFrame], args: 
 
 def run_raw_nd2_pipeline(args: argparse.Namespace) -> None:
     ensure_dir(args.output_root)
+    if getattr(args, "nd2_alignment", "sift") == "sift" and args.skip_registration:
+        raise ValueError(
+            "--nd2-alignment sift requires ImageJ registration and cannot be combined with --skip-registration."
+        )
+
     jobs = build_raw_jobs(args)
     logging.info("Prepared %d raw ND2 FOV jobs.", len(jobs))
 
@@ -1944,15 +2346,20 @@ run("Enhance Contrast", "saturated=0.35");
 print("Loaded stack has " + nSlices + " slices, starting SIFT alignment...");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
 wait(4000);
-alignedTitle = "Aligned 54 of 54";
-if (isOpen(alignedTitle)) {{
-    selectWindow(alignedTitle);
-}} else if (isOpen("Aligned")) {{
-    selectWindow("Aligned");
-}} else {{
-    print("ERROR: Aligned stack window 'Aligned 54 of 54' not found after SIFT");
+alignedTitle = "";
+for (widx = 1; widx <= nImages; widx++) {{
+    selectImage(widx);
+    tt = getTitle();
+    if (indexOf(tt, "Aligned") == 0) {{
+        alignedTitle = tt;
+        break;
+    }}
+}}
+if (alignedTitle == "") {{
+    print("ERROR: No Fiji stack window titled with prefix 'Aligned' after SIFT");
     exit();
 }}
+selectWindow(alignedTitle);
 print("Aligned stack active: " + getTitle());
 dest = "{path_for_macro(dest_dir)}";
 if (!File.exists(dest)) {{
@@ -2026,15 +2433,20 @@ run("Enhance Contrast", "saturated=0.35");
 print("Loaded stack has " + nSlices + " slices, starting SIFT alignment...");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
 wait(4000);
-alignedTitle = "Aligned 54 of 54";
-if (isOpen(alignedTitle)) {{
-    selectWindow(alignedTitle);
-}} else if (isOpen("Aligned")) {{
-    selectWindow("Aligned");
-}} else {{
-    print("ERROR: Aligned stack window 'Aligned 54 of 54' not found after SIFT");
+alignedTitle = "";
+for (widx = 1; widx <= nImages; widx++) {{
+    selectImage(widx);
+    tt = getTitle();
+    if (indexOf(tt, "Aligned") == 0) {{
+        alignedTitle = tt;
+        break;
+    }}
+}}
+if (alignedTitle == "") {{
+    print("ERROR: No Fiji stack window titled with prefix 'Aligned' after SIFT");
     exit();
 }}
+selectWindow(alignedTitle);
 print("Aligned stack active: " + getTitle());
 roiManager("Reset");
 roiManager("Open", "{path_for_macro(config.laser_roi_path)}");
