@@ -2478,8 +2478,8 @@ makeRectangle(crop_x, crop_y, crop_w, crop_h);
 run("Crop");
 run("Enhance Contrast", "saturated=0.35");
 resetMinAndMax();
-// Recreate bleaching ROI in cropped coordinates
-makePolygon(xpoints, ypoints, n_points);
+// Recreate bleaching ROI in cropped coordinates (arrays: use makeSelection, not makePolygon)
+makeSelection("polygon", xpoints, ypoints);
 roiManager("Reset");
 roiManager("Add");
 roiManager("Select", 0);
