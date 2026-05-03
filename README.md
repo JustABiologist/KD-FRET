@@ -177,10 +177,4 @@ Every row in the CSV/XLSX corresponds to a single Cellpose ROI and contains:
 For any other issue, re-run with `--log-level DEBUG` and check the console plus the ImageJ window output; the macros now print detailed status messages around registration, saving, and ROI handling.
 
 
-python kd_fret_multiplex.py \
-  --mode raw-nd2 \
-  --input-root /path/to/day \
-  --output-root /path/to/output \
-  --fovs-per-well-by-measurement 5 10 10 5 \
-  --roi-mode prompt-ring \
-  --background-mode auto
+python kd_fret_multiplex.py --mode raw-nd2 --input-root /path/to/day --output-root /path/to/output --fovs-per-well-by-measurement 5 10 10 5 --roi-mode prompt-ring --background-mode auto
