@@ -81,6 +81,12 @@ TIFF workflow. Pass `--laser-roi` to skip the prompt and reuse a saved ROI. Use
 `--nd2-alignment none` only as a non-SIFT fallback; in that mode `--roi-mode`
 controls prompt-ring, prompt-two, or auto-laser ROI handling.
 
+To restart from saved aligned/cropped stacks, keep the same input/output roots
+and add `--skip-registration`. The raw SIFT restart path reuses
+`<output-root>/01_registered/<measurement>/xyNN/`. Add `--skip-cellpose` as well
+when the matching masks already exist under
+`<output-root>/03_cellpose_raw_output/<measurement>/`.
+
 ```bash
 python kd_fret_multiplex.py \
   --mode raw-nd2 \
@@ -100,8 +106,8 @@ and `background_mode`.
 
 Workflow summary:
 
-1. The script discovers all measurements/FOVs, initializes ImageJ (unless reused
-   ROI and `--skip-registration`).
+1. The script discovers all measurements/FOVs and initializes ImageJ unless
+   `--skip-registration` is reusing saved registered stacks.
 2. If no ROI is supplied, it aligns one stack, shows the post-bleach mCherry
    frame in ImageJ, and waits for you to draw the laser ROI (oval tool selected
    by default, brightness/contrast dialog open).
@@ -131,7 +137,7 @@ Workflow summary:
 | `--laser-roi PATH` | Reuse an existing ImageJ ROI file instead of prompting. |
 | `--nd2-alignment sift\|none` | Raw ND2 alignment mode; `sift` is the deployment/default path. |
 | `--roi-mode prompt-ring\|prompt-two\|auto-laser` | Only used with `--nd2-alignment none`. |
-| `--skip-registration` | Legacy TIFF only, or invalid with raw ND2 SIFT mode. |
+| `--skip-registration` | Reuse existing registered stacks; raw SIFT expects `01_registered/<measurement>/xyNN/`. |
 | `--imagej-distribution STR` | Pass custom ImageJ/Fiji distribution string to `imagej.init()`. |
 | `--sequence-start INT` | Legacy TIFF start index passed to `File.openSequence` (default 5). |
 | `--nd2-align-frame-start INT` | Raw ND2 SIFT start index; keep the default `1`. |

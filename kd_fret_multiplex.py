@@ -1620,6 +1620,10 @@ def write_registered_donor_cellpose_frame(
     tifffile.imwrite(frame_path, image)
 
 
+def registered_stack_available(registered_dir: Path) -> bool:
+    return registered_dir.is_dir() and bool(stack_frame_files(registered_dir))
+
+
 def fov_label_for_position(position_index: int, args: argparse.Namespace, fov_map: Mapping[str, Mapping[str, str]]) -> str:
     if args.fov_labels and position_index < len(args.fov_labels):
         return str(args.fov_labels[position_index])
@@ -1758,6 +1762,113 @@ def build_raw_jobs_python_crop(args: argparse.Namespace) -> List[RawFovJob]:
     return jobs
 
 
+def build_raw_jobs_sift_restart(args: argparse.Namespace) -> List[RawFovJob]:
+    """
+    Build raw SIFT jobs from existing ``01_registered`` cropped stacks.
+
+    This is the restart path for ``--skip-registration``. It does not initialize
+    ImageJ, materialize virtual ND2 TIFFs, prompt for ROIs, or rewrite
+    registered stacks. If Cellpose is not skipped, the donor-before Cellpose
+    frame is regenerated from each saved registered stack.
+    """
+    fov_map = load_fov_map(args.fov_map)
+    measurement_dirs = discover_raw_measurement_dirs(args.input_root)
+    measurement_labels = load_nested_cli_list(args.measurement_labels_json, "--measurement-labels-json")
+    jobs: List[RawFovJob] = []
+
+    for measurement_index, (measurement_name, measurement_dir) in enumerate(measurement_dirs):
+        role_files = parse_raw_nd2_files(measurement_dir, args)
+        if not role_files:
+            logging.warning("No usable ND2 files found in %s", measurement_dir)
+            continue
+        safe_measurement = safe_path_name(measurement_name)
+        cellpose_dir = raw_cellpose_input_dir(args, measurement_name, measurement_dir)
+        cellpose_masks_dir = raw_cellpose_output_dir(args, measurement_name, measurement_dir)
+        missing_roles = [
+            role
+            for role in ("donor_before", "donor_after", "acceptor_before", "acceptor_after", "laser")
+            if role not in role_files
+        ]
+        if missing_roles:
+            raise ValueError(
+                f"{measurement_name}: missing ND2 roles for SIFT restart: {', '.join(missing_roles)}. "
+                "Laboratory standard: five files Seq0000..Seq0004 (laser is Seq0002)."
+            )
+
+        position_count = infer_position_count(role_files, args)
+        fovs_per_well = fovs_per_well_for_measurement(
+            args.fovs_per_well_by_measurement,
+            measurement_index,
+            len(measurement_dirs),
+            args.fovs_per_well,
+        )
+        labels_for_measurement = select_measurement_spec(
+            measurement_labels,
+            measurement_index,
+            len(measurement_dirs),
+            "--measurement-labels-json",
+        )
+        fov_disp_list = [fov_label_for_position(i, args, fov_map) for i in range(position_count)]
+        ij_tags = [fov_ij_filter_tag(f) for f in fov_disp_list]
+        if len(set(ij_tags)) != len(ij_tags):
+            raise ValueError(
+                f"{measurement_name}: FOV labels map to duplicate ImageJ tags {ij_tags}. "
+                "Adjust numbering or pass distinct --fov-labels entries."
+            )
+
+        for position_index in range(position_count):
+            fov_disp = fov_disp_list[position_index]
+            fov_tag = ij_tags[position_index]
+            registered_dir = (args.output_root / "01_registered" / safe_measurement / fov_tag).resolve()
+            if not registered_stack_available(registered_dir):
+                logging.warning(
+                    "Skipping %s %s: no registered cropped stack found in %s",
+                    measurement_name,
+                    fov_disp,
+                    registered_dir,
+                )
+                continue
+
+            well_index, well, iptg_label, condition = metadata_for_measurement_position(
+                fov=fov_disp,
+                position_number=position_index + 1,
+                position_count=position_count,
+                fov_map=fov_map,
+                fovs_per_well=fovs_per_well,
+                labels=labels_for_measurement,
+            )
+            frame_path = cellpose_dir / f"{safe_path_name(fov_disp)}_donor_pre_frame{args.cellpose_frame_index:04d}.tif"
+            mask_path = cellpose_masks_dir / f"{frame_path.stem}_cp_masks.tif"
+            if not args.skip_cellpose:
+                write_registered_donor_cellpose_frame(registered_dir, frame_path, args)
+
+            jobs.append(
+                RawFovJob(
+                    measurement_name=measurement_name,
+                    measurement_dir=measurement_dir,
+                    position_index=position_index,
+                    fov=fov_disp,
+                    well_index=well_index,
+                    well=well,
+                    iptg_label=iptg_label,
+                    condition=condition,
+                    role_files=role_files,
+                    cellpose_frame_path=frame_path,
+                    cellpose_mask_path=mask_path,
+                    crop_rect=None,
+                    registered_stack_dir=registered_dir,
+                )
+            )
+
+    if not jobs:
+        raise RuntimeError(
+            "No raw ND2 restart jobs were prepared. Expected existing stacks under "
+            f"{args.output_root / '01_registered'}."
+        )
+    logging.info("Reusing %d existing registered cropped stacks from %s.", len(jobs), args.output_root / "01_registered")
+    return jobs
+
+
 def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
     """
     TIFF-multiplex parity: write flat virtual TIFF sequences under nd2_ij_source/,
@@ -1770,6 +1881,8 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
             "Raw ND2 SIFT mode requires --nd2-align-frame-start 1 so all "
             "Seq0000..Seq0004 frames remain available for quantification."
         )
+    if args.skip_registration:
+        return build_raw_jobs_sift_restart(args)
 
     scratch_ij = ensure_dir(args.output_root / "nd2_ij_source")
     fov_map = load_fov_map(args.fov_map)
@@ -2542,11 +2655,6 @@ def resolve_cellpose_mask_path(job: RawFovJob) -> Optional[Path]:
 
 def run_raw_nd2_pipeline(args: argparse.Namespace) -> None:
     ensure_dir(args.output_root)
-    if getattr(args, "nd2_alignment", "sift") == "sift" and args.skip_registration:
-        raise ValueError(
-            "--nd2-alignment sift requires ImageJ registration and cannot be combined with --skip-registration."
-        )
-
     jobs = build_raw_jobs(args)
     logging.info("Prepared %d raw ND2 FOV jobs.", len(jobs))
 
