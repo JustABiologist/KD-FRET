@@ -12,11 +12,12 @@ The trailing Seq digit maps roles (Seq0000-Seq0004) only via SEQ_ROLE_MAP; chann
 aliases are not used when Seq is present (see parse_raw_nd2_files).
 
 Raw ND2 default (`--nd2-alignment sift`): virtual TIFF stacks are written per
-FOV, ImageJ aligns them with Linear Stack Alignment (SIFT), the user draws a
-single global bleaching ROI on an aligned post-bleach mCherry image, and
-`register_and_crop` writes cropped stacks under `01_registered/`. Cellpose and
-quantification then operate on those cropped, aligned stacks, matching the
-legacy TIFF path.
+FOV in legacy TIFF order (donor-before, donor-after, acceptor-before,
+acceptor-after) without laser-only planes. ImageJ aligns them with Linear Stack
+Alignment (SIFT), the user draws a single global bleaching ROI on an aligned
+post-bleach mCherry image, and `register_and_crop` writes cropped stacks under
+`01_registered/`. Cellpose and quantification then operate on those cropped,
+aligned stacks, matching the legacy TIFF path.
 
 Alternative (`--nd2-alignment none`): Python ROI cropping before Cellpose and
 mask expansion during quantification.
@@ -103,11 +104,14 @@ class PipelineConfig:
     cellpose_model: str
     cellpose_diameter: float
     cellpose_channels: Tuple[int, int]
+    cellpose_use_gpu: bool
     iptg_concentrations: Optional[List[float]]
     fovs_per_iptg: int
     run_id: str
     csv_decimal: str
     multiplex: bool
+    full_image: bool = False
+    full_aligned_root: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +140,11 @@ class RawFovJob:
     # Full-image crop rectangle used when --nd2-alignment none crops Cellpose input.
     crop_rect: Optional[Tuple[int, int, int, int]] = None
     registered_stack_dir: Optional[Path] = None
+    full_stack_dir: Optional[Path] = None
+    full_cellpose_frame_path: Optional[Path] = None
+    full_cellpose_mask_path: Optional[Path] = None
+    crop_metadata_path: Optional[Path] = None
+    full_image_bg: Optional[Dict[str, object]] = None
 
 # --------------------------------------------------------------------------------------
 # CLI parsing helpers
@@ -204,6 +213,26 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Dilate cell masks by this many pixels before estimating cell-free background.",
+    )
+    parser.add_argument(
+        "--full-image",
+        action="store_true",
+        help=(
+            "Raw ND2 SIFT only: run Cellpose on full aligned FOVs, derive cropped masks, "
+            "and use global lowest full-image cell-free backgrounds."
+        ),
+    )
+    parser.add_argument(
+        "--full-image-bg-exclusion-px",
+        type=int,
+        default=20,
+        help="Dilate full-image Cellpose masks by this many pixels before background estimation.",
+    )
+    parser.add_argument(
+        "--full-image-bg-min-pixels",
+        type=int,
+        default=50,
+        help="Minimum full-image cell-free pixels required for a valid FOV background estimate.",
     )
     parser.add_argument(
         "--sequence-start",
@@ -432,6 +461,11 @@ def parse_args() -> argparse.Namespace:
         help="Cellpose channel specification, e.g. 0 0 for grayscale.",
     )
     parser.add_argument(
+        "--cellpose-use-gpu",
+        action="store_true",
+        help="Pass --use_gpu to the Cellpose CLI.",
+    )
+    parser.add_argument(
         "--cellpose-review-outputs",
         action="store_true",
         help="Also save Cellpose PNG/outlines/ROI review outputs. Slower; masks are always saved as TIFF.",
@@ -541,6 +575,24 @@ def raw_cellpose_input_dir(args: argparse.Namespace, measurement_name: str, meas
 def raw_cellpose_output_dir(args: argparse.Namespace, measurement_name: str, measurement_dir: Path) -> Path:
     return ensure_dir(
         args.output_root / "03_cellpose_raw_output" / raw_measurement_output_subpath(args, measurement_name, measurement_dir)
+    )
+
+
+def raw_full_cellpose_input_dir(args: argparse.Namespace, measurement_name: str, measurement_dir: Path) -> Path:
+    return ensure_dir(
+        args.output_root / "02_cellpose_full_input" / raw_measurement_output_subpath(args, measurement_name, measurement_dir)
+    )
+
+
+def raw_full_cellpose_output_dir(args: argparse.Namespace, measurement_name: str, measurement_dir: Path) -> Path:
+    return ensure_dir(
+        args.output_root / "03_cellpose_full_output" / raw_measurement_output_subpath(args, measurement_name, measurement_dir)
+    )
+
+
+def raw_full_background_mask_dir(args: argparse.Namespace, measurement_name: str, measurement_dir: Path) -> Path:
+    return ensure_dir(
+        args.output_root / "04_full_image_background_masks" / raw_measurement_output_subpath(args, measurement_name, measurement_dir)
     )
 
 
@@ -684,12 +736,23 @@ SEQ_ROLE_MAP: Mapping[int, str] = {
     4: "acceptor_after",
 }
 
-# Composite stack order matching Seq0000..Seq0004 for ImageJ alignment + partitioning.
-ND2_IJ_ROLE_ORDER: Tuple[str, ...] = (
+# Raw acquisition order matching Seq0000..Seq0004.
+ND2_ACQUISITION_ROLE_ORDER: Tuple[str, ...] = (
     "acceptor_before",
     "donor_before",
     "laser",
     "donor_after",
+    "acceptor_after",
+)
+
+# SIFT alignment/quantification order. This mirrors the legacy registered TIFF
+# stack: donor-before, donor-after, acceptor-before, acceptor-after. Laser-only
+# frames are intentionally omitted because they do not contain cell structure and
+# can break the alignment chain before donor-after frames.
+ND2_SIFT_ROLE_ORDER: Tuple[str, ...] = (
+    "donor_before",
+    "donor_after",
+    "acceptor_before",
     "acceptor_after",
 )
 
@@ -1480,11 +1543,14 @@ def nd2_ij_pipeline_config(args: argparse.Namespace) -> PipelineConfig:
         cellpose_model=args.cellpose_model,
         cellpose_diameter=args.cellpose_diameter,
         cellpose_channels=tuple(args.cellpose_channels),
+        cellpose_use_gpu=bool(args.cellpose_use_gpu),
         iptg_concentrations=None,
         fovs_per_iptg=args.fovs_per_iptg,
         run_id=args.run_id,
         csv_decimal=args.csv_decimal,
         multiplex=True,
+        full_image=bool(args.full_image),
+        full_aligned_root=(args.output_root / "00_aligned_full").resolve(),
     )
 
 
@@ -1496,8 +1562,9 @@ def materialize_nd2_fov_ij_stack(
     args: argparse.Namespace,
 ) -> int:
     """
-    Write ``{ij_tag}use####.tif`` frames into one flat measurement directory (multiplex TIFF layout).
+    Write ``{ij_tag}use####.tif`` frames into one flat measurement directory.
 
+    The raw laser-only planes are deliberately omitted from this SIFT stack.
     Multiple FOVs share *dest_measurement_dir*; filenames are distinguished by ``ij_tag``.
     """
     counts = raw_role_frame_counts(args)
@@ -1505,7 +1572,7 @@ def materialize_nd2_fov_ij_stack(
     for old_frame in dest_measurement_dir.glob(f"{ij_tag}use*.tif*"):
         old_frame.unlink()
     planes: List[np.ndarray] = []
-    for role in ND2_IJ_ROLE_ORDER:
+    for role in ND2_SIFT_ROLE_ORDER:
         raw_nd2 = role_files[role]
         stk = trim_stack(
             read_nd2_position_stack(raw_nd2.path, position_index, counts[role]),
@@ -1528,10 +1595,26 @@ def split_registered_stack_into_roles(
     seq_start_onebased = max(1, int(args.nd2_align_frame_start))
     rg0 = seq_start_onebased - 1
     glob_hi = rg0 + int(stack.shape[0])
+    expected_sift = sum(counts[role] for role in ND2_SIFT_ROLE_ORDER)
+    expected_with_laser = sum(counts[role] for role in ND2_ACQUISITION_ROLE_ORDER)
+    if int(stack.shape[0]) == expected_sift:
+        role_order = ND2_SIFT_ROLE_ORDER
+    elif int(stack.shape[0]) == expected_with_laser:
+        raise ValueError(
+            "Registered raw ND2 stack contains laser frames. Those outputs were "
+            "created by an older SIFT path that aligned through laser-only images; "
+            "rerun registration once without --skip-registration."
+        )
+    else:
+        raise ValueError(
+            f"Registered raw ND2 stack has {stack.shape[0]} planes, expected "
+            f"{expected_sift} quantification planes "
+            f"({', '.join(ND2_SIFT_ROLE_ORDER)}) for current raw counts."
+        )
     off = 0
 
     pieces: Dict[str, np.ndarray] = {}
-    for role in ND2_IJ_ROLE_ORDER:
+    for role in role_order:
         lo_g = off
         hi_g = off + counts[role]
         off = hi_g
@@ -1561,7 +1644,7 @@ def split_registered_stack_into_roles(
         "donor_after_n": donor_after.shape[0],
         "acceptor_before_n": acc_before.shape[0],
         "acceptor_after_n": acc_after.shape[0],
-        "laser_n": 0 if laser_stack_p is None else int(laser_stack_p.shape[0]),
+        "laser_n": counts["laser"],
     }
     return donor_before, donor_after, acc_before, acc_after, laser_stack_p, cnt
 
@@ -1569,10 +1652,9 @@ def split_registered_stack_into_roles(
 def raw_nd2_post_bleach_prompt_slice(args: argparse.Namespace) -> int:
     """Return the one-based composite slice index for the first aligned mCherry after-bleach frame."""
     return int(
-        args.acceptor_before_count
-        + args.donor_before_count
-        + args.laser_count
+        args.donor_before_count
         + args.donor_after_count
+        + args.acceptor_before_count
         + 1
     )
 
@@ -1617,6 +1699,23 @@ def write_registered_donor_cellpose_frame(
         args.cellpose_frame_index,
         "registered donor_before Cellpose frame",
     ).astype(np.float32, copy=False)
+    tifffile.imwrite(frame_path, image)
+
+
+def write_full_registered_donor_cellpose_frame(
+    full_stack_dir: Path,
+    frame_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    """Write the donor-before frame used by full-image Cellpose from a full aligned stack."""
+    stack = load_registered_composite_stack(full_stack_dir)
+    donor_before, _, _, _, _, _ = split_registered_stack_into_roles(stack, args)
+    image = select_frame(
+        donor_before,
+        args.cellpose_frame_index,
+        "full aligned donor_before Cellpose frame",
+    ).astype(np.float32, copy=False)
+    ensure_dir(frame_path.parent)
     tifffile.imwrite(frame_path, image)
 
 
@@ -1784,6 +1883,8 @@ def build_raw_jobs_sift_restart(args: argparse.Namespace) -> List[RawFovJob]:
         safe_measurement = safe_path_name(measurement_name)
         cellpose_dir = raw_cellpose_input_dir(args, measurement_name, measurement_dir)
         cellpose_masks_dir = raw_cellpose_output_dir(args, measurement_name, measurement_dir)
+        full_cellpose_dir = raw_full_cellpose_input_dir(args, measurement_name, measurement_dir) if args.full_image else None
+        full_cellpose_masks_dir = raw_full_cellpose_output_dir(args, measurement_name, measurement_dir) if args.full_image else None
         missing_roles = [
             role
             for role in ("donor_before", "donor_after", "acceptor_before", "acceptor_after", "laser")
@@ -1829,6 +1930,26 @@ def build_raw_jobs_sift_restart(args: argparse.Namespace) -> List[RawFovJob]:
                 )
                 continue
 
+            full_stack_dir = None
+            full_frame_path = None
+            full_mask_path = None
+            crop_metadata_path = None
+            if args.full_image:
+                full_stack_dir = (args.output_root / "00_aligned_full" / safe_measurement / fov_tag).resolve()
+                crop_metadata_path = registered_dir / "crop_metadata.json"
+                if not registered_stack_available(full_stack_dir):
+                    raise RuntimeError(
+                        f"{measurement_name} {fov_disp}: --full-image restart requires full aligned stack "
+                        f"at {full_stack_dir}. Rerun registration once with --full-image."
+                    )
+                if not crop_metadata_path.exists():
+                    raise RuntimeError(
+                        f"{measurement_name} {fov_disp}: --full-image restart requires crop metadata "
+                        f"at {crop_metadata_path}. Rerun registration once with --full-image."
+                    )
+                full_frame_path = full_cellpose_dir / f"{safe_path_name(fov_disp)}_donor_pre_frame{args.cellpose_frame_index:04d}.tif"
+                full_mask_path = full_cellpose_masks_dir / f"{full_frame_path.stem}_cp_masks.tif"
+
             well_index, well, iptg_label, condition = metadata_for_measurement_position(
                 fov=fov_disp,
                 position_number=position_index + 1,
@@ -1840,7 +1961,10 @@ def build_raw_jobs_sift_restart(args: argparse.Namespace) -> List[RawFovJob]:
             frame_path = cellpose_dir / f"{safe_path_name(fov_disp)}_donor_pre_frame{args.cellpose_frame_index:04d}.tif"
             mask_path = cellpose_masks_dir / f"{frame_path.stem}_cp_masks.tif"
             if not args.skip_cellpose:
-                write_registered_donor_cellpose_frame(registered_dir, frame_path, args)
+                if args.full_image:
+                    write_full_registered_donor_cellpose_frame(full_stack_dir, full_frame_path, args)
+                else:
+                    write_registered_donor_cellpose_frame(registered_dir, frame_path, args)
 
             jobs.append(
                 RawFovJob(
@@ -1857,6 +1981,10 @@ def build_raw_jobs_sift_restart(args: argparse.Namespace) -> List[RawFovJob]:
                     cellpose_mask_path=mask_path,
                     crop_rect=None,
                     registered_stack_dir=registered_dir,
+                    full_stack_dir=full_stack_dir,
+                    full_cellpose_frame_path=full_frame_path,
+                    full_cellpose_mask_path=full_mask_path,
+                    crop_metadata_path=crop_metadata_path,
                 )
             )
 
@@ -1990,6 +2118,8 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
         safe_measurement = safe_path_name(measurement_name)
         cellpose_dir = raw_cellpose_input_dir(args, measurement_name, measurement_dir)
         cellpose_masks_dir = raw_cellpose_output_dir(args, measurement_name, measurement_dir)
+        full_cellpose_dir = raw_full_cellpose_input_dir(args, measurement_name, measurement_dir) if args.full_image else None
+        full_cellpose_masks_dir = raw_full_cellpose_output_dir(args, measurement_name, measurement_dir) if args.full_image else None
         missing_roles = [
             role
             for role in ("donor_before", "donor_after", "acceptor_before", "acceptor_after", "laser")
@@ -2048,6 +2178,25 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
             fov_disp = fov_disp_list[position_index]
             fov_tag = ij_tags[position_index]
             registered_dir = (ij_cfg.registered_root / measurement.name / fov_tag).resolve()
+            full_stack_dir = None
+            full_frame_path = None
+            full_mask_path = None
+            crop_metadata_path = None
+            if args.full_image:
+                full_stack_dir = (ij_cfg.full_aligned_root / measurement.name / fov_tag).resolve()
+                crop_metadata_path = registered_dir / "crop_metadata.json"
+                if not registered_stack_available(full_stack_dir):
+                    raise RuntimeError(
+                        f"{measurement_name} {fov_disp}: --full-image registration did not save full aligned stack "
+                        f"at {full_stack_dir}."
+                    )
+                if not crop_metadata_path.exists():
+                    raise RuntimeError(
+                        f"{measurement_name} {fov_disp}: --full-image registration did not save crop metadata "
+                        f"at {crop_metadata_path}."
+                    )
+                full_frame_path = full_cellpose_dir / f"{safe_path_name(fov_disp)}_donor_pre_frame{args.cellpose_frame_index:04d}.tif"
+                full_mask_path = full_cellpose_masks_dir / f"{full_frame_path.stem}_cp_masks.tif"
             well_index, well, iptg_label, condition = metadata_for_measurement_position(
                 fov=fov_disp,
                 position_number=position_index + 1,
@@ -2058,7 +2207,10 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
             )
             frame_path = cellpose_dir / f"{safe_path_name(fov_disp)}_donor_pre_frame{args.cellpose_frame_index:04d}.tif"
             mask_path = cellpose_masks_dir / f"{frame_path.stem}_cp_masks.tif"
-            write_registered_donor_cellpose_frame(registered_dir, frame_path, args)
+            if args.full_image:
+                write_full_registered_donor_cellpose_frame(full_stack_dir, full_frame_path, args)
+            else:
+                write_registered_donor_cellpose_frame(registered_dir, frame_path, args)
 
             job = RawFovJob(
                 measurement_name=measurement_name,
@@ -2074,6 +2226,10 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
                 cellpose_mask_path=mask_path,
                 crop_rect=None,
                 registered_stack_dir=registered_dir,
+                full_stack_dir=full_stack_dir,
+                full_cellpose_frame_path=full_frame_path,
+                full_cellpose_mask_path=full_mask_path,
+                crop_metadata_path=crop_metadata_path,
             )
             jobs.append(job)
 
@@ -2376,7 +2532,18 @@ def quantify_raw_job(job: RawFovJob, args: argparse.Namespace) -> pd.DataFrame:
     cell_union = mask > 0
     bg_mask = background_pixels(cell_union, bleach_mask, args)
 
-    if args.background_mode == "manual":
+    if args.full_image:
+        full_bg = getattr(args, "full_image_global_backgrounds", None)
+        if not full_bg:
+            raise ValueError("--full-image quantification requires computed full-image backgrounds.")
+        donor_bg = float(full_bg["donor"])
+        acceptor_bg = float(full_bg["acceptor"])
+        donor_before_corr = donor_before
+        donor_after_corr = donor_after
+        acc_before_corr = acc_before
+        acc_after_corr = acc_after
+        subtract_scalar = True
+    elif args.background_mode == "manual":
         if args.background_donor is None or args.background_acceptor is None:
             raise ValueError("--background-mode manual requires --background-donor and --background-acceptor.")
         donor_bg = float(args.background_donor)
@@ -2519,63 +2686,88 @@ def quantify_raw_job(job: RawFovJob, args: argparse.Namespace) -> pd.DataFrame:
             or (area_class == "Bleached" and bleached_pass)
         )
 
-        records.append(
-            {
-                "run_id": args.run_id,
-                "measurement": job.measurement_name,
-                "fov": job.fov,
-                "position_index": int(job.position_index + 1),
-                "well_index": int(job.well_index),
-                "well": job.well,
-                "iptg_label": job.iptg_label,
-                "condition": job.condition,
-                "cell_label": int(label),
-                "area_class": area_class,
-                "analysis_included": bool(analysis_included),
-                "in_bleach_roi": area_class == "Bleached",
-                "in_unbleached_ring": area_class == "UnbleachedRing",
-                "bleach_overlap_fraction": bleach_fraction,
-                "ring_overlap_fraction": ring_fraction,
-                "area_px": int(cell.sum()),
-                "major_axis_px": float(prop.major_axis_length),
-                "minor_axis_px": float(prop.minor_axis_length),
-                "angle_deg": float(np.degrees(prop.orientation)),
-                "quality_ratio": quality_ratio,
-                "DonBB": don_bb,
-                "DonAB": don_ab,
-                "AccBB": acc_bb,
-                "AccAB": acc_ab,
-                "BG_don": donor_bg,
-                "BG_acc": acceptor_bg,
-                "BG_pixel_count": int(bg_mask.sum()),
-                "DonBB_BG": don_bb_bg,
-                "DonAB_BG": don_ab_bg,
-                "AccBB_BG": acc_bb_bg,
-                "ACCAB_BG": acc_ab_bg,
-                "FRET": fret,
-                "BleachedPercent": bleached,
-                "Fac": fac,
-                "CorrFRET": corr_fret,
-                "Ratio": ratio_metric,
-                "BleachedPass": bleached_pass,
-                "background_mode": args.background_mode,
-                "crop_rect": str(job.crop_rect),
-                **counts,
-                "cellpose_frame_path": str(job.cellpose_frame_path),
-                "cellpose_mask_path": str(job.cellpose_mask_path),
-                "measurement_dir": str(job.measurement_dir),
-                "donor_before_file": str(job.role_files["donor_before"].path),
-                "donor_after_file": str(job.role_files["donor_after"].path),
-                "acceptor_before_file": str(job.role_files["acceptor_before"].path),
-                "acceptor_after_file": str(job.role_files["acceptor_after"].path),
-                "laser_file": str(job.role_files["laser"].path) if "laser" in job.role_files else "",
-            }
+        full_bg_info = job.full_image_bg or {}
+        bg_pixel_count = (
+            int(full_bg_info.get("free_pixel_count", bg_mask.sum()))
+            if args.full_image
+            else int(bg_mask.sum())
         )
+        record = {
+            "run_id": args.run_id,
+            "measurement": job.measurement_name,
+            "fov": job.fov,
+            "position_index": int(job.position_index + 1),
+            "well_index": int(job.well_index),
+            "well": job.well,
+            "iptg_label": job.iptg_label,
+            "condition": job.condition,
+            "cell_label": int(label),
+            "area_class": area_class,
+            "analysis_included": bool(analysis_included),
+            "in_bleach_roi": area_class == "Bleached",
+            "in_unbleached_ring": area_class == "UnbleachedRing",
+            "bleach_overlap_fraction": bleach_fraction,
+            "ring_overlap_fraction": ring_fraction,
+            "area_px": int(cell.sum()),
+            "major_axis_px": float(prop.major_axis_length),
+            "minor_axis_px": float(prop.minor_axis_length),
+            "angle_deg": float(np.degrees(prop.orientation)),
+            "quality_ratio": quality_ratio,
+            "DonBB": don_bb,
+            "DonAB": don_ab,
+            "AccBB": acc_bb,
+            "AccAB": acc_ab,
+            "BG_don": donor_bg,
+            "BG_acc": acceptor_bg,
+            "BG_pixel_count": bg_pixel_count,
+            "DonBB_BG": don_bb_bg,
+            "DonAB_BG": don_ab_bg,
+            "AccBB_BG": acc_bb_bg,
+            "ACCAB_BG": acc_ab_bg,
+            "FRET": fret,
+            "BleachedPercent": bleached,
+            "Fac": fac,
+            "CorrFRET": corr_fret,
+            "Ratio": ratio_metric,
+            "BleachedPass": bleached_pass,
+            "background_mode": "full-image" if args.full_image else args.background_mode,
+            "crop_rect": str(job.crop_rect),
+            **counts,
+            "cellpose_frame_path": str(
+                job.full_cellpose_frame_path
+                if args.full_image and job.full_cellpose_frame_path is not None
+                else job.cellpose_frame_path
+            ),
+            "cellpose_mask_path": str(job.cellpose_mask_path),
+            "measurement_dir": str(job.measurement_dir),
+            "donor_before_file": str(job.role_files["donor_before"].path),
+            "donor_after_file": str(job.role_files["donor_after"].path),
+            "acceptor_before_file": str(job.role_files["acceptor_before"].path),
+            "acceptor_after_file": str(job.role_files["acceptor_after"].path),
+            "laser_file": str(job.role_files["laser"].path) if "laser" in job.role_files else "",
+        }
+        if args.full_image:
+            record.update(
+                {
+                    "BG_don_fov_identified": full_bg_info.get("donor_bg_fov", np.nan),
+                    "BG_acc_fov_identified": full_bg_info.get("acceptor_bg_fov", np.nan),
+                    "BG_don_source_fov": full_bg_info.get("donor_global_source", ""),
+                    "BG_acc_source_fov": full_bg_info.get("acceptor_global_source", ""),
+                    "full_cellpose_frame_path": str(job.full_cellpose_frame_path or ""),
+                    "full_cellpose_mask_path": str(job.full_cellpose_mask_path or ""),
+                    "full_image_bg_mask_path": str(full_bg_info.get("bg_mask_path", "")),
+                }
+            )
+        records.append(record)
 
     return pd.DataFrame(records)
 
 
-def save_raw_workbook(results_by_measurement: Mapping[str, pd.DataFrame], args: argparse.Namespace) -> Path:
+def save_raw_workbook(
+    results_by_measurement: Mapping[str, pd.DataFrame],
+    args: argparse.Namespace,
+    full_image_bg_df: Optional[pd.DataFrame] = None,
+) -> Path:
     workbook_path = args.output_xlsx or (args.output_root / "multiplex_results.xlsx")
     ensure_dir(workbook_path.parent)
     used_sheet_names: set[str] = set()
@@ -2592,6 +2784,10 @@ def save_raw_workbook(results_by_measurement: Mapping[str, pd.DataFrame], args: 
             else:
                 df.to_excel(writer, index=False, sheet_name=sheet)
             wrote_sheet = True
+        if full_image_bg_df is not None:
+            sheet = sanitize_sheet_name("FullImageBG", used_sheet_names)
+            full_image_bg_df.to_excel(writer, index=False, sheet_name=sheet)
+            wrote_sheet = True
         if not wrote_sheet:
             pd.DataFrame([{"message": "No raw ND2 results generated"}]).to_excel(
                 writer,
@@ -2602,16 +2798,21 @@ def save_raw_workbook(results_by_measurement: Mapping[str, pd.DataFrame], args: 
     return workbook_path
 
 
-def raw_cellpose_job_groups(jobs: Sequence[RawFovJob]) -> Dict[Tuple[Path, Path], List[RawFovJob]]:
+def raw_cellpose_job_groups(jobs: Sequence[RawFovJob], args: argparse.Namespace) -> Dict[Tuple[Path, Path], List[RawFovJob]]:
     groups: Dict[Tuple[Path, Path], List[RawFovJob]] = {}
     for job in jobs:
-        key = (job.cellpose_frame_path.parent, job.cellpose_mask_path.parent)
+        if args.full_image:
+            if job.full_cellpose_frame_path is None or job.full_cellpose_mask_path is None:
+                raise ValueError(f"{job.measurement_name} {job.fov}: missing full-image Cellpose paths.")
+            key = (job.full_cellpose_frame_path.parent, job.full_cellpose_mask_path.parent)
+        else:
+            key = (job.cellpose_frame_path.parent, job.cellpose_mask_path.parent)
         groups.setdefault(key, []).append(job)
     return groups
 
 
 def run_raw_cellpose(jobs: Sequence[RawFovJob], args: argparse.Namespace) -> None:
-    groups = raw_cellpose_job_groups(jobs)
+    groups = raw_cellpose_job_groups(jobs, args)
     for group_index, ((input_dir, output_dir), group_jobs) in enumerate(groups.items(), start=1):
         logging.info(
             "Running Cellpose group %d/%d on %d raw ND2 frames: %s -> %s",
@@ -2628,7 +2829,32 @@ def run_raw_cellpose(jobs: Sequence[RawFovJob], args: argparse.Namespace) -> Non
             channels=args.cellpose_channels,
             savedir=output_dir,
             review_outputs=args.cellpose_review_outputs,
+            use_gpu=args.cellpose_use_gpu,
         )
+
+
+def full_cellpose_mask_candidates(job: RawFovJob) -> List[Path]:
+    if job.full_cellpose_frame_path is None or job.full_cellpose_mask_path is None:
+        return []
+    candidates = [
+        job.full_cellpose_mask_path,
+        job.full_cellpose_frame_path.with_name(job.full_cellpose_frame_path.stem + "_cp_masks.tif"),
+    ]
+    seen: set[Path] = set()
+    unique: List[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(candidate)
+    return unique
+
+
+def resolve_full_cellpose_mask_path(job: RawFovJob) -> Optional[Path]:
+    for candidate in full_cellpose_mask_candidates(job):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def cellpose_mask_candidates(job: RawFovJob) -> List[Path]:
@@ -2653,8 +2879,250 @@ def resolve_cellpose_mask_path(job: RawFovJob) -> Optional[Path]:
     return None
 
 
+def load_crop_metadata(path: Path) -> Dict[str, int]:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with path.open("r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    required = ("crop_x", "crop_y", "crop_w", "crop_h", "full_width", "full_height")
+    missing = [key for key in required if key not in raw]
+    if missing:
+        raise ValueError(f"{path}: missing crop metadata keys: {', '.join(missing)}")
+    metadata = {key: int(round(float(raw[key]))) for key in required}
+    if metadata["crop_w"] <= 0 or metadata["crop_h"] <= 0:
+        raise ValueError(f"{path}: invalid crop size {metadata['crop_w']}x{metadata['crop_h']}")
+    return metadata
+
+
+def first_stack_plane_shape(stack_dir: Path) -> Tuple[int, int]:
+    frames = stack_frame_files(stack_dir)
+    if not frames:
+        raise FileNotFoundError(f"No TIFF sequence frames in {stack_dir}")
+    plane = np.asarray(tifffile.imread(frames[0]))
+    if plane.ndim != 2:
+        plane = np.squeeze(plane)
+    if plane.ndim != 2:
+        raise ValueError(f"{frames[0]} is not a 2D TIFF plane after squeezing: shape {plane.shape}")
+    return int(plane.shape[0]), int(plane.shape[1])
+
+
+def derive_cropped_cellpose_mask_from_full(job: RawFovJob) -> Path:
+    if job.crop_metadata_path is None:
+        raise ValueError(f"{job.measurement_name} {job.fov}: missing crop metadata path.")
+    if job.full_cellpose_mask_path is None:
+        raise ValueError(f"{job.measurement_name} {job.fov}: missing full-image Cellpose mask path.")
+    if job.registered_stack_dir is None:
+        raise ValueError(f"{job.measurement_name} {job.fov}: missing registered stack path.")
+
+    metadata = load_crop_metadata(job.crop_metadata_path)
+    full_mask = np.asarray(tifffile.imread(job.full_cellpose_mask_path))
+    if full_mask.ndim == 3:
+        full_mask = full_mask[0]
+    y0 = metadata["crop_y"]
+    x0 = metadata["crop_x"]
+    y1 = y0 + metadata["crop_h"]
+    x1 = x0 + metadata["crop_w"]
+    if y0 < 0 or x0 < 0 or y1 > full_mask.shape[0] or x1 > full_mask.shape[1]:
+        raise ValueError(
+            f"{job.measurement_name} {job.fov}: crop metadata {metadata} is outside full mask shape {full_mask.shape}."
+        )
+    cropped = full_mask[y0:y1, x0:x1]
+    expected_shape = first_stack_plane_shape(job.registered_stack_dir)
+    if cropped.shape != expected_shape:
+        raise ValueError(
+            f"{job.measurement_name} {job.fov}: derived cropped mask shape {cropped.shape} "
+            f"!= registered stack plane shape {expected_shape}."
+        )
+    ensure_dir(job.cellpose_mask_path.parent)
+    tifffile.imwrite(job.cellpose_mask_path, cropped.astype(full_mask.dtype, copy=False))
+    logging.info("Saved derived cropped Cellpose mask for %s %s to %s", job.measurement_name, job.fov, job.cellpose_mask_path)
+    return job.cellpose_mask_path
+
+
+def prepare_full_image_masks(jobs: Sequence[RawFovJob], args: argparse.Namespace) -> None:
+    for job in jobs:
+        resolved_full_mask = resolve_full_cellpose_mask_path(job)
+        if resolved_full_mask is None:
+            raise RuntimeError(
+                f"Missing full-image Cellpose mask for {job.measurement_name} {job.fov}. Checked: "
+                + ", ".join(str(path) for path in full_cellpose_mask_candidates(job))
+            )
+        job.full_cellpose_mask_path = resolved_full_mask
+        derive_cropped_cellpose_mask_from_full(job)
+
+
+def full_image_background_mask_path(job: RawFovJob, args: argparse.Namespace) -> Path:
+    return raw_full_background_mask_dir(args, job.measurement_name, job.measurement_dir) / f"{safe_path_name(job.fov)}_bg_free_mask.tif"
+
+
+def mean_frame_medians_for_mask(stack: np.ndarray, bg_mask: np.ndarray) -> float:
+    values: List[float] = []
+    for frame in stack:
+        pixels = frame[bg_mask]
+        if pixels.size:
+            values.append(float(np.nanmedian(pixels)))
+    return float(np.nanmean(values)) if values else np.nan
+
+
+def save_full_image_background_histogram(
+    values: Sequence[float],
+    selected_value: float,
+    output_path: Path,
+    title: str,
+    xlabel: str,
+) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:  # pragma: no cover - depends on local env
+        raise ImportError("Full-image background histograms require matplotlib.") from exc
+
+    ensure_dir(output_path.parent)
+    plt.figure(figsize=(7, 4.5))
+    plt.hist([value for value in values if np.isfinite(value)], bins="auto", color="#4477AA", edgecolor="white")
+    plt.axvline(selected_value, color="#CC3311", linewidth=2, label=f"selected {selected_value:.3g}")
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel("FOV count")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+
+
+def compute_full_image_backgrounds(jobs: Sequence[RawFovJob], args: argparse.Namespace) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for job in jobs:
+        if job.full_stack_dir is None or job.full_cellpose_mask_path is None:
+            raise ValueError(f"{job.measurement_name} {job.fov}: missing full-image stack/mask paths.")
+
+        full_stack = load_registered_composite_stack(job.full_stack_dir)
+        donor_before, donor_after, acc_before, acc_after, _, _ = split_registered_stack_into_roles(full_stack, args)
+        full_mask = load_mask(job.full_cellpose_mask_path)
+        if full_mask.shape != full_stack.shape[1:]:
+            raise ValueError(
+                f"{job.measurement_name} {job.fov}: full mask shape {full_mask.shape} "
+                f"!= full aligned stack plane shape {full_stack.shape[1:]}"
+            )
+
+        cell_exclusion = morphology.binary_dilation(
+            (full_mask > 0),
+            morphology.disk(max(1, int(args.full_image_bg_exclusion_px))),
+        )
+        bg_free_mask = ~cell_exclusion
+        free_pixel_count = int(bg_free_mask.sum())
+        bg_mask_path = full_image_background_mask_path(job, args)
+        tifffile.imwrite(bg_mask_path, bg_free_mask.astype(np.uint8))
+
+        donor_bg_fov = np.nan
+        acceptor_bg_fov = np.nan
+        donor_valid = free_pixel_count >= int(args.full_image_bg_min_pixels)
+        acceptor_valid = donor_valid
+        if donor_valid:
+            donor_bg_fov = mean_frame_medians_for_mask(
+                np.concatenate([donor_before, donor_after], axis=0),
+                bg_free_mask,
+            )
+            donor_valid = bool(np.isfinite(donor_bg_fov))
+        if acceptor_valid:
+            acceptor_bg_fov = mean_frame_medians_for_mask(
+                np.concatenate([acc_before, acc_after], axis=0),
+                bg_free_mask,
+            )
+            acceptor_valid = bool(np.isfinite(acceptor_bg_fov))
+
+        row = {
+            "measurement": job.measurement_name,
+            "fov": job.fov,
+            "well": job.well,
+            "condition": job.condition,
+            "free_pixel_count": free_pixel_count,
+            "donor_bg_fov": donor_bg_fov,
+            "acceptor_bg_fov": acceptor_bg_fov,
+            "donor_valid": bool(donor_valid),
+            "acceptor_valid": bool(acceptor_valid),
+            "donor_global_source": "",
+            "acceptor_global_source": "",
+            "full_mask_path": str(job.full_cellpose_mask_path),
+            "bg_mask_path": str(bg_mask_path),
+        }
+        rows.append(row)
+        job.full_image_bg = dict(row)
+
+    df = pd.DataFrame(rows)
+    valid_donor = df[df["donor_valid"]].copy()
+    valid_acceptor = df[df["acceptor_valid"]].copy()
+    if valid_donor.empty:
+        raise RuntimeError(
+            "Full-image background mode found no valid donor FOV backgrounds. "
+            "Try lowering --full-image-bg-min-pixels or inspect monolayer FOVs."
+        )
+    if valid_acceptor.empty:
+        raise RuntimeError(
+            "Full-image background mode found no valid acceptor FOV backgrounds. "
+            "Try lowering --full-image-bg-min-pixels or inspect monolayer FOVs."
+        )
+
+    donor_idx = valid_donor["donor_bg_fov"].astype(float).idxmin()
+    acceptor_idx = valid_acceptor["acceptor_bg_fov"].astype(float).idxmin()
+    donor_bg = float(df.loc[donor_idx, "donor_bg_fov"])
+    acceptor_bg = float(df.loc[acceptor_idx, "acceptor_bg_fov"])
+    donor_source = f"{df.loc[donor_idx, 'measurement']}/{df.loc[donor_idx, 'fov']}"
+    acceptor_source = f"{df.loc[acceptor_idx, 'measurement']}/{df.loc[acceptor_idx, 'fov']}"
+
+    df["donor_global_source"] = donor_source
+    df["acceptor_global_source"] = acceptor_source
+    args.background_donor = donor_bg
+    args.background_acceptor = acceptor_bg
+    args.full_image_global_backgrounds = {
+        "donor": donor_bg,
+        "acceptor": acceptor_bg,
+        "donor_source": donor_source,
+        "acceptor_source": acceptor_source,
+    }
+
+    by_key = {(row["measurement"], row["fov"]): row for row in df.to_dict("records")}
+    for job in jobs:
+        job.full_image_bg = by_key.get((job.measurement_name, job.fov), job.full_image_bg)
+
+    csv_path = ensure_dir(args.output_root / "csv") / "full_image_background_by_fov.csv"
+    df.to_csv(csv_path, index=False, decimal=args.csv_decimal)
+    plots_dir = ensure_dir(args.output_root / "plots")
+    save_full_image_background_histogram(
+        valid_donor["donor_bg_fov"].astype(float).tolist(),
+        donor_bg,
+        plots_dir / "full_image_background_donor_histogram.png",
+        "Full-image donor background by FOV",
+        "Donor background",
+    )
+    save_full_image_background_histogram(
+        valid_acceptor["acceptor_bg_fov"].astype(float).tolist(),
+        acceptor_bg,
+        plots_dir / "full_image_background_acceptor_histogram.png",
+        "Full-image acceptor background by FOV",
+        "Acceptor background",
+    )
+    logging.info(
+        "Selected full-image backgrounds: donor %.6g from %s, acceptor %.6g from %s.",
+        donor_bg,
+        donor_source,
+        acceptor_bg,
+        acceptor_source,
+    )
+    return df
+
+
 def run_raw_nd2_pipeline(args: argparse.Namespace) -> None:
     ensure_dir(args.output_root)
+    if args.full_image:
+        if getattr(args, "nd2_alignment", "sift") != "sift":
+            raise ValueError("--full-image is only supported with raw ND2 --nd2-alignment sift.")
+        if args.background_mode == "manual":
+            if args.background_donor is None or args.background_acceptor is None:
+                raise ValueError("--full-image --background-mode manual requires --background-donor and --background-acceptor.")
+        elif args.background_mode != "auto":
+            raise ValueError("--full-image supports --background-mode auto or manual.")
     jobs = build_raw_jobs(args)
     logging.info("Prepared %d raw ND2 FOV jobs.", len(jobs))
 
@@ -2663,10 +3131,23 @@ def run_raw_nd2_pipeline(args: argparse.Namespace) -> None:
     else:
         logging.info("Skipping Cellpose execution.")
 
+    if args.full_image:
+        prepare_full_image_masks(jobs, args)
+
     if args.skip_measurement:
         logging.info("Measurement step skipped; raw ND2 pipeline finished after preparation.")
         return
 
+    if args.full_image and args.background_mode == "manual":
+        args.full_image_global_backgrounds = {
+            "donor": float(args.background_donor),
+            "acceptor": float(args.background_acceptor),
+            "donor_source": "manual",
+            "acceptor_source": "manual",
+        }
+        full_image_bg_df = None
+    else:
+        full_image_bg_df = compute_full_image_backgrounds(jobs, args) if args.full_image else None
     csv_dir = ensure_dir(args.output_root / "csv")
     results_by_measurement: Dict[str, List[pd.DataFrame]] = {}
     total_jobs = len(jobs)
@@ -2711,7 +3192,7 @@ def run_raw_nd2_pipeline(args: argparse.Namespace) -> None:
         safe_name = safe_path_name(measurement_name)
         df.to_csv(csv_dir / f"{safe_name}_results.csv", index=False, decimal=args.csv_decimal)
 
-    save_raw_workbook(combined, args)
+    save_raw_workbook(combined, args, full_image_bg_df=full_image_bg_df)
 
 
 # --------------------------------------------------------------------------------------
@@ -2855,6 +3336,38 @@ def register_and_crop(
     dest_unbleached_dir = reset_dir(dest_unbleached_parent / fov)
     roi_mask_path = (dest_dir / "bleach_roi_mask.tif")
     roi_crop_path = (dest_dir / "bleach_roi_crop.roi")
+    full_save_macro = ""
+    crop_metadata_macro = ""
+    if config.full_image:
+        if config.full_aligned_root is None:
+            raise ValueError("Full-image registration requires config.full_aligned_root.")
+        dest_full_parent = ensure_dir(config.full_aligned_root / measurement.name)
+        dest_full_dir = reset_dir(dest_full_parent / fov)
+        crop_metadata_path = dest_dir / "crop_metadata.json"
+        full_save_macro = f"""
+destFull = "{path_for_macro(dest_full_dir)}";
+if (!File.exists(destFull)) {{
+    File.makeDirectory(destFull);
+}}
+print("Saving full aligned sequence to " + destFull + "/");
+run("Image Sequence... ", "select=[" + destFull + "/] dir=[" + destFull + "/] format=TIFF name={fov}use");
+print("Saved full aligned sequence to " + destFull + "/");
+selectWindow(alignedTitle);
+"""
+        crop_metadata_macro = f"""
+metadata = "{{\\n" +
+"  \\"crop_x\\": " + crop_x + ",\\n" +
+"  \\"crop_y\\": " + crop_y + ",\\n" +
+"  \\"crop_w\\": " + crop_w + ",\\n" +
+"  \\"crop_h\\": " + crop_h + ",\\n" +
+"  \\"full_width\\": " + img_w + ",\\n" +
+"  \\"full_height\\": " + img_h + ",\\n" +
+"  \\"measurement\\": \\"{measurement.name}\\",\\n" +
+"  \\"fov\\": \\"{fov}\\"\\n" +
+"}}\\n";
+File.saveString(metadata, "{path_for_macro(crop_metadata_path)}");
+print("Saved crop metadata to {path_for_macro(crop_metadata_path)}");
+"""
     src_dir, open_options = imagej_open_sequence_args(measurement, fov, config.sequence_start)
     macro = f"""
 run("Close All");
@@ -2879,6 +3392,7 @@ if (alignedTitle == "") {{
 }}
 selectWindow(alignedTitle);
 print("Aligned stack active: " + getTitle());
+{full_save_macro}
 roiManager("Reset");
 roiManager("Open", "{path_for_macro(config.laser_roi_path)}");
 roiManager("Select", 0);
@@ -2899,6 +3413,7 @@ img_w = getWidth();
 img_h = getHeight();
 if (crop_x + crop_w > img_w) crop_w = img_w - crop_x;
 if (crop_y + crop_h > img_h) crop_h = img_h - crop_y;
+{crop_metadata_macro}
 // Shift ROI coordinates into crop coordinate system
 for (i = 0; i < n_points; i++) {{
     xpoints[i] = xpoints[i] - crop_x;
@@ -2993,6 +3508,7 @@ def run_cellpose_cli(
     channels: Tuple[int, int],
     savedir: Optional[Path] = None,
     review_outputs: bool = True,
+    use_gpu: bool = False,
 ) -> None:
     cmd = [
         "cellpose",
@@ -3013,6 +3529,8 @@ def run_cellpose_cli(
     if savedir is not None:
         ensure_dir(savedir)
         cmd.extend(["--savedir", str(savedir)])
+    if use_gpu:
+        cmd.append("--use_gpu")
     if review_outputs:
         cmd.extend(["--save_png", "--save_outlines", "--save_rois"])
     logging.info("Running Cellpose: %s", " ".join(cmd))
@@ -3349,6 +3867,9 @@ def main() -> None:
         run_raw_nd2_pipeline(args)
         return
 
+    if args.full_image:
+        raise ValueError("--full-image is only supported in raw ND2 mode.")
+
     if args.background_donor is None or args.background_acceptor is None:
         raise ValueError(
             "Legacy TIFF mode requires --background-donor and --background-acceptor "
@@ -3380,6 +3901,7 @@ def main() -> None:
         cellpose_model=args.cellpose_model,
         cellpose_diameter=args.cellpose_diameter,
         cellpose_channels=tuple(args.cellpose_channels),
+        cellpose_use_gpu=bool(args.cellpose_use_gpu),
         iptg_concentrations=args.iptg_concentrations,
         fovs_per_iptg=args.fovs_per_iptg,
         run_id=args.run_id,
@@ -3460,6 +3982,7 @@ def main() -> None:
             model=config.cellpose_model,
             diameter=config.cellpose_diameter,
             channels=config.cellpose_channels,
+            use_gpu=config.cellpose_use_gpu,
         )
     else:
         logging.info("Skipping Cellpose execution.")

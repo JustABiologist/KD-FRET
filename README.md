@@ -22,7 +22,7 @@ Unified Python workflow that replicates the legacy KD-FRET processing chain writ
    conda activate kd-fret
    ```
    The environment bundles `pyimagej`, `nd2`, `tifffile`, `openpyxl`, `cellpose`,
-   `roifile`, and the scientific stack.
+   `roifile`, `matplotlib`, and the scientific stack.
 
 2. **ImageJ / Fiji**  
    - Default: `pyimagej` downloads a headless Fiji bundle automatically.
@@ -68,16 +68,19 @@ donor-after frames, and 2 acceptor-after frames per FOV.
 | --- | --- | ---: | --- |
 | `Seq0000` | `acceptor_before` / mCherry before bleach | 2 | `AccBB`, last 2 frames |
 | `Seq0001` | `donor_before` | 20 | Cellpose frame 5; `DonBB`, last 3 frames |
-| `Seq0002` | laser / acceptor bleaching | 4 | stack alignment continuity and ROI context |
+| `Seq0002` | laser / acceptor bleaching | 4 | raw acquisition record only; excluded from SIFT quantification stacks |
 | `Seq0003` | `donor_after` | 18 | `DonAB`, first 3 frames |
 | `Seq0004` | `acceptor_after` / mCherry after bleach | 2 | ROI prompt image; `AccAB`, first 2 frames |
 
 With `--nd2-alignment sift` (default), the script writes a flat virtual TIFF
-multiplex under `<output-root>/nd2_ij_source/`, runs Fiji linear stack alignment
-(SIFT), prompts for one global laser ROI on an aligned post-bleach mCherry image,
-then writes cropped aligned stacks under `01_registered/`. Cellpose receives the
-fifth donor pre-bleach frame from the cropped aligned stack, matching the legacy
-TIFF workflow. Pass `--laser-roi` to skip the prompt and reuse a saved ROI. Use
+multiplex under `<output-root>/nd2_ij_source/` in legacy TIFF order:
+donor-before, donor-after, acceptor-before, acceptor-after. The laser-only
+frames are not included in this SIFT/quantification stack. Fiji linear stack
+alignment (SIFT) then runs on that stack, the script prompts for one global
+laser ROI on an aligned post-bleach mCherry image, and cropped aligned stacks
+are written under `01_registered/`. Cellpose receives the fifth donor
+pre-bleach frame from the cropped aligned stack, matching the legacy TIFF
+workflow. Pass `--laser-roi` to skip the prompt and reuse a saved ROI. Use
 `--nd2-alignment none` only as a non-SIFT fallback; in that mode `--roi-mode`
 controls prompt-ring, prompt-two, or auto-laser ROI handling.
 
@@ -85,7 +88,18 @@ To restart from saved aligned/cropped stacks, keep the same input/output roots
 and add `--skip-registration`. The raw SIFT restart path reuses
 `<output-root>/01_registered/<measurement>/xyNN/`. Add `--skip-cellpose` as well
 when the matching masks already exist under
-`<output-root>/03_cellpose_raw_output/<measurement>/`.
+`<output-root>/03_cellpose_raw_output/<measurement>/`. Registered raw ND2 stacks
+from older runs that still contain the laser planes must be regenerated once.
+
+Add `--full-image` to run Cellpose once on full aligned FOVs and derive the
+cropped quantification masks from those full-FOV masks. This mode also estimates
+cell-free full-image backgrounds by dilating all cells by 20 px, computes one
+donor and one acceptor background per FOV, and uses the lowest valid donor and
+acceptor FOV backgrounds globally. It requires `--nd2-alignment sift` and
+`--background-mode auto`. For restarts, `--full-image` also accepts
+`--background-mode manual` with `--background-donor` and `--background-acceptor`;
+that reuses the full/cropped Cellpose masks and skips the full-image background
+CSV/histogram pass.
 
 ```bash
 python kd_fret_multiplex.py \
@@ -103,6 +117,9 @@ integer per sorted subdirectory; the pipeline infers the well count from
 `Well02`, etc. Add `--measurement-labels-json` only when you want custom well or
 condition labels. The output rows include `BG_don`, `BG_acc`, `BG_pixel_count`,
 and `background_mode`.
+With `--full-image`, the workbook also includes `FullImageBG`, and the same
+per-FOV background table is written to
+`<output-root>/csv/full_image_background_by_fov.csv`.
 
 Workflow summary:
 
@@ -138,6 +155,7 @@ Workflow summary:
 | `--nd2-alignment sift\|none` | Raw ND2 alignment mode; `sift` is the deployment/default path. |
 | `--roi-mode prompt-ring\|prompt-two\|auto-laser` | Only used with `--nd2-alignment none`. |
 | `--skip-registration` | Reuse existing registered stacks; raw SIFT expects `01_registered/<measurement>/xyNN/`. |
+| `--full-image` | Raw ND2 SIFT only: save full aligned stacks, run full-FOV Cellpose, derive cropped masks, and use global lowest full-image backgrounds. |
 | `--imagej-distribution STR` | Pass custom ImageJ/Fiji distribution string to `imagej.init()`. |
 | `--sequence-start INT` | Legacy TIFF start index passed to `File.openSequence` (default 5). |
 | `--nd2-align-frame-start INT` | Raw ND2 SIFT start index; keep the default `1`. |
@@ -149,6 +167,7 @@ Workflow summary:
 | `--cellpose-model STR` | Cellpose pretrained model (default `bact_fluor_cp3`). |
 | `--cellpose-diameter FLOAT` | Expected object diameter (default 25). |
 | `--cellpose-channels CH1 CH2` | Channel indices for Cellpose (default `0 0`). |
+| `--cellpose-use-gpu` | Pass `--use_gpu` to Cellpose. |
 | `--cellpose-review-outputs` | Raw ND2 only: also save Cellpose PNG/outlines/ROI review files; slower on old CPUs. |
 | `--skip-cellpose` | Skip launching Cellpose; assumes `_cp_masks.tif` already exist. |
 
@@ -158,6 +177,8 @@ Workflow summary:
 | `--background-mode manual\|auto\|rolling-ball` | Raw ND2 background correction mode. |
 | `--background-donor FLOAT` | Donor background value, required for manual background and legacy TIFF mode. |
 | `--background-acceptor FLOAT` | Acceptor background value, required for manual background and legacy TIFF mode. |
+| `--full-image-bg-exclusion-px INT` | Full-image mode only: dilate cell masks before background estimation (default 20). |
+| `--full-image-bg-min-pixels INT` | Full-image mode only: minimum free pixels for a valid FOV background (default 50). |
 | `--fovs-per-well-by-measurement ...` | FOVs per well for each sorted measurement subdirectory, or one value reused for all. |
 | `--measurement-labels-json JSON_OR_PATH` | Optional nested labels per sorted measurement subdirectory. |
 | `--fov-map PATH` | Optional CSV mapping FOVs to well/condition metadata. |
@@ -178,9 +199,14 @@ Workflow summary:
 
 ```
 <output-root>/
+├── 00_aligned_full/MeXX/xyYY/*.tif      # Full aligned stacks when --full-image is used
 ├── 01_registered/MeXX/xyYY/*.tif        # Cropped, aligned stacks
+├── 02_cellpose_full_input/MeXX/*.tif    # Full-FOV Cellpose inputs when --full-image is used
 ├── 02_cellpose_raw_input/MeXX/*.tif     # Raw ND2 Cellpose inputs, mirrored by measurement
+├── 03_cellpose_full_output/MeXX/*_cp_masks.tif
 ├── 03_cellpose_raw_output/MeXX/*_cp_masks.tif
+├── 04_full_image_background_masks/MeXX/*_bg_free_mask.tif
+├── plots/full_image_background_*_histogram.png
 ├── csv/*_results.csv                    # Per-measurement CSV files
 └── multiplex_results.xlsx               # One sheet per measurement subdirectory
 ```
@@ -191,6 +217,7 @@ Every row in the CSV/XLSX corresponds to a single Cellpose ROI and contains:
 - ROI geometry (area, axes, angle), quality ratio, background-corrected signals
 - FRET, Bleached%, Fac, CorrFRET, ratio (AccBB_BG / DonAB_BG)
 - References to the registered stack directory and mask path
+- Full-image mode source backgrounds and full-FOV mask paths when `--full-image` is enabled
 
 ---
 

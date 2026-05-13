@@ -6,6 +6,7 @@ dependencies:
   - openjdk=11
   - numpy>=1.26
   - pandas>=2.1
+  - matplotlib>=3.8
   - cellpose>=3.0
   - scikit-image>=0.22
   - tifffile>=2024.2
@@ -16,4 +17,3 @@ dependencies:
       - nd2>=0.10
       - pyimagej
       - roifile>=2026.2.10
-
