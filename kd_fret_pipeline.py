@@ -606,6 +606,15 @@ def load_mask(mask_path: Path) -> np.ndarray:
     return mask
 
 
+def imagej_std(values: np.ndarray, axis: int) -> np.ndarray:
+    """Match ImageJ Results-table StdDev: sample stddev, zero for one-pixel ROIs."""
+    if values.shape[axis] <= 1:
+        out_shape = list(values.shape)
+        out_shape.pop(axis)
+        return np.zeros(out_shape, dtype=float)
+    return np.std(values, axis=axis, ddof=1)
+
+
 def compute_roi_timeseries(
     stack: np.ndarray,
     mask: np.ndarray,
@@ -637,7 +646,7 @@ def compute_roi_timeseries(
         minor = float(prop.minor_axis_length)
         series = stack[:, cell_mask]
         mean_series = series.mean(axis=1)
-        std_series = series.std(axis=1, ddof=0)
+        std_series = imagej_std(series, axis=1)
 
         with np.errstate(divide="ignore", invalid="ignore"):
             ratio_series = np.where(std_series != 0, mean_series / std_series, np.nan)

@@ -8,8 +8,9 @@ files named like:
 
     YYYYMMDD_HHMMSS_001_<channelname>_Seq0000.nd2
 
-The trailing Seq digit maps roles (Seq0000-Seq0004) only via SEQ_ROLE_MAP; channel
-aliases are not used when Seq is present (see parse_raw_nd2_files).
+The trailing Seq digit maps roles (Seq0000-Seq0004) only via SEQ_ROLE_MAP.
+Channel aliases are used only as consistency hints in log messages, never for
+role assignment (see parse_raw_nd2_files).
 
 Raw ND2 default (`--nd2-alignment sift`): virtual TIFF stacks are written per
 FOV in legacy TIFF order (donor-before, donor-after, acceptor-before,
@@ -250,28 +251,19 @@ def parse_args() -> argparse.Namespace:
         "--donor-channel-name",
         type=str,
         default=None,
-        help="Substring used to identify donor-channel ND2 files. If omitted, aliases are inferred.",
+        help="Optional donor substring used only to warn if channel text disagrees with the Seq role.",
     )
     parser.add_argument(
         "--acceptor-channel-name",
         type=str,
         default=None,
-        help="Substring used to identify acceptor-channel ND2 files. If omitted, aliases are inferred.",
+        help="Optional acceptor substring used only to warn if channel text disagrees with the Seq role.",
     )
     parser.add_argument(
         "--laser-channel-name",
         type=str,
         default=None,
-        help="Substring used to identify laser/bleach ND2 files. If omitted, aliases are inferred.",
-    )
-    parser.add_argument(
-        "--role-order",
-        nargs=5,
-        default=["acceptor_before", "donor_before", "laser", "donor_after", "acceptor_after"],
-        choices=["donor_before", "donor_after", "acceptor_before", "acceptor_after", "laser"],
-        help=(
-            "Fallback acquisition role order for the five ND2 files when Seq numbers are not 0-4."
-        ),
+        help="Optional laser substring used only to warn if channel text disagrees with the Seq role.",
     )
     parser.add_argument(
         "--fov-labels",
@@ -780,57 +772,25 @@ def infer_channel_role(channel_name: str, args: argparse.Namespace) -> Optional[
     return None
 
 
-def expand_before_after_roles(files: Sequence[RawNd2File], args: argparse.Namespace) -> Dict[str, RawNd2File]:
-    sorted_files = sorted(files, key=lambda item: (item.seq, item.path.name))
+def expand_before_after_roles(files: Sequence[RawNd2File]) -> Dict[str, RawNd2File]:
     role_files: Dict[str, RawNd2File] = {}
 
-    for frame_file in sorted_files:
+    for frame_file in files:
         seq_role = SEQ_ROLE_MAP.get(frame_file.seq)
-        if seq_role is not None:
-            if seq_role in role_files:
-                raise ValueError(
-                    f"Duplicate ND2 Seq role {seq_role}: "
-                    f"{role_files[seq_role].path} and {frame_file.path}"
-                )
-            role_files[seq_role] = frame_file
-
-    if set(SEQ_ROLE_MAP.values()).issubset(role_files):
-        return role_files
-
-    donor_pending: List[RawNd2File] = []
-    acceptor_pending: List[RawNd2File] = []
-
-    for frame_file in sorted_files:
-        if SEQ_ROLE_MAP.get(frame_file.seq) is not None:
+        if seq_role is None:
+            logging.warning(
+                "Ignoring ND2 %s because Seq%04d is outside the standard Seq0000..Seq0004 role map.",
+                frame_file.path,
+                frame_file.seq,
+            )
             continue
-        if frame_file.role in {"donor_before", "donor_after", "acceptor_before", "acceptor_after", "laser"}:
-            if frame_file.role in role_files:
-                logging.warning(
-                    "Duplicate role %s (non-Seq): keeping %s, ignoring %s",
-                    frame_file.role,
-                    role_files[frame_file.role].path,
-                    frame_file.path,
-                )
-            else:
-                role_files[frame_file.role] = frame_file
-        elif frame_file.role == "donor":
-            donor_pending.append(frame_file)
-        elif frame_file.role == "acceptor":
-            acceptor_pending.append(frame_file)
+        if seq_role in role_files:
+            raise ValueError(
+                f"Duplicate ND2 Seq role {seq_role}: "
+                f"{role_files[seq_role].path} and {frame_file.path}"
+            )
+        role_files[seq_role] = frame_file
 
-    if donor_pending:
-        if len(donor_pending) >= 1 and "donor_before" not in role_files:
-            role_files["donor_before"] = donor_pending[0]
-        if len(donor_pending) >= 2 and "donor_after" not in role_files:
-            role_files["donor_after"] = donor_pending[-1]
-    if acceptor_pending:
-        if len(acceptor_pending) >= 1 and "acceptor_before" not in role_files:
-            role_files["acceptor_before"] = acceptor_pending[0]
-        if len(acceptor_pending) >= 2 and "acceptor_after" not in role_files:
-            role_files["acceptor_after"] = acceptor_pending[-1]
-
-    for role, item in zip(args.role_order, sorted_files):
-        role_files.setdefault(role, item)
     return role_files
 
 
@@ -849,7 +809,7 @@ def parse_raw_nd2_files(
     args: argparse.Namespace,
 ) -> Dict[str, RawNd2File]:
     files: List[RawNd2File] = []
-    for path in sorted(measurement_dir.rglob("*.nd2")):
+    for path in measurement_dir.rglob("*.nd2"):
         match = ND2_FILE_RE.match(path.name)
         if not match:
             logging.warning("Skipping ND2 with unexpected name: %s", path)
@@ -860,7 +820,7 @@ def parse_raw_nd2_files(
         seq_digit = int(match.group("seq"))
         hinted = infer_channel_role(channel, args)
         canonical = SEQ_ROLE_MAP.get(seq_digit)
-        assigned = canonical if canonical is not None else (hinted if hinted is not None else "unknown")
+        assigned = canonical if canonical is not None else "unknown"
         if (
             canonical is not None
             and hinted
@@ -904,7 +864,12 @@ def parse_raw_nd2_files(
 
     if not files:
         return {}
-    return expand_before_after_roles(files, args)
+    role_files = expand_before_after_roles(files)
+    if not role_files:
+        raise ValueError(
+            f"{measurement_dir}: found ND2 files, but none use the standard Seq0000..Seq0004 role map."
+        )
+    return role_files
 
 
 def load_fov_map(path: Optional[Path]) -> Dict[str, Dict[str, str]]:
@@ -1787,7 +1752,7 @@ def build_raw_jobs_python_crop(args: argparse.Namespace) -> List[RawFovJob]:
         if missing_roles:
             raise ValueError(
                 f"{measurement_name}: missing required ND2 roles: {', '.join(missing_roles)}. "
-                "Use Seq0000..Seq0004 filenames or legacy --role-order."
+                "Use the laboratory-standard Seq0000..Seq0004 filenames."
             )
         if "laser" not in role_files and args.roi_mode == "auto-laser":
             raise ValueError(f"{measurement_name}: --roi-mode auto-laser requires a laser ND2 file.")
@@ -2640,7 +2605,7 @@ def quantify_raw_job(job: RawFovJob, args: argparse.Namespace) -> pd.DataFrame:
             continue
 
         pixels = segmentation_image[cell]
-        seg_std = float(np.nanstd(pixels))
+        seg_std = float(imagej_std(pixels))
         quality_ratio = float(np.nanmean(pixels) / seg_std) if seg_std else np.nan
         if np.isnan(quality_ratio) or quality_ratio < args.min_quality_ratio:
             continue
@@ -3559,6 +3524,19 @@ def load_mask(mask_path: Path) -> np.ndarray:
     return mask
 
 
+def imagej_std(values: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
+    """Match ImageJ Results-table StdDev: sample stddev, zero for one-pixel ROIs."""
+    if axis is None:
+        if values.size <= 1:
+            return np.asarray(0.0)
+        return np.std(values, ddof=1)
+    if values.shape[axis] <= 1:
+        out_shape = list(values.shape)
+        out_shape.pop(axis)
+        return np.zeros(out_shape, dtype=float)
+    return np.std(values, axis=axis, ddof=1)
+
+
 def compute_roi_timeseries(
     stack: np.ndarray,
     mask: np.ndarray,
@@ -3618,7 +3596,7 @@ def compute_roi_timeseries(
         minor = float(prop.minor_axis_length)
         series = stack[:, cell_mask]
         mean_series = series.mean(axis=1)
-        std_series = series.std(axis=1, ddof=0)
+        std_series = imagej_std(series, axis=1)
 
         with np.errstate(divide="ignore", invalid="ignore"):
             ratio_series = np.where(std_series != 0, mean_series / std_series, np.nan)
