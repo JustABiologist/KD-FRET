@@ -27,14 +27,19 @@ mask expansion during quantification.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import logging
+import multiprocessing
+from multiprocessing.connection import wait as wait_multiprocessing_connections
+import os
 import time
 import re
 import shutil
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -113,6 +118,8 @@ class PipelineConfig:
     multiplex: bool
     full_image: bool = False
     full_aligned_root: Optional[Path] = None
+    exact_fov_use_filter: bool = False
+    expected_sequence_frames: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +153,25 @@ class RawFovJob:
     full_cellpose_mask_path: Optional[Path] = None
     crop_metadata_path: Optional[Path] = None
     full_image_bg: Optional[Dict[str, object]] = None
+
+
+@dataclass
+class RawSiftMeasurementPlan:
+    measurement_index: int
+    measurement_count: int
+    measurement_name: str
+    measurement_dir: Path
+    safe_measurement: str
+    role_files: Dict[str, RawNd2File]
+    position_count: int
+    fovs_per_well: int
+    labels: Optional[List[object]]
+    fov_disp_list: List[str]
+    ij_tags: List[str]
+    cellpose_dir: Path
+    cellpose_masks_dir: Path
+    full_cellpose_dir: Optional[Path] = None
+    full_cellpose_masks_dir: Optional[Path] = None
 
 # --------------------------------------------------------------------------------------
 # CLI parsing helpers
@@ -462,6 +488,41 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also save Cellpose PNG/outlines/ROI review outputs. Slower; masks are always saved as TIFF.",
     )
+    parser.add_argument(
+        "--keep-nd2-ij-source",
+        action="store_true",
+        help=(
+            "Keep the temporary raw ND2 ImageJ source TIFFs under nd2_ij_source/. "
+            "By default each measurement's staging TIFFs are deleted after registration "
+            "and Cellpose frame staging to reduce disk usage."
+        ),
+    )
+    parser.add_argument(
+        "--nd2-sift-registration-retries",
+        type=int,
+        default=1,
+        help=(
+            "Raw ND2 SIFT only: extra attempts for a FOV when registered TIFF "
+            "sequence validation fails after ImageJ registration."
+        ),
+    )
+    parser.add_argument(
+        "--nd2-sift-prefetch-measurements",
+        action="store_true",
+        help=(
+            "Raw ND2 SIFT only: materialize the next measurement's temporary "
+            "ImageJ source TIFFs while the current measurement is registering."
+        ),
+    )
+    parser.add_argument(
+        "--nd2-sift-registration-workers",
+        type=int,
+        default=1,
+        help=(
+            "Raw ND2 SIFT only: number of independent ImageJ worker processes "
+            "used to register FOV chunks within each measurement."
+        ),
+    )
     # In Multiplex mode, this is optional/ignored
     parser.add_argument(
         "--iptg-concentrations",
@@ -599,16 +660,35 @@ def path_for_macro(path: Path) -> str:
     return str(path).replace("\\", "/")
 
 
+def imagej_expected_slices_macro(config: PipelineConfig, label: str) -> str:
+    expected = config.expected_sequence_frames
+    if expected is None:
+        return ""
+    expected_i = int(expected)
+    safe_label = str(label).replace("\\", "\\\\").replace('"', '\\"')
+    return f"""
+if (nSlices != {expected_i}) {{
+    msg = "{safe_label}: opened " + nSlices + " slices, expected {expected_i}.";
+    print("ERROR: " + msg);
+    run("Close All");
+    exit(msg);
+}}
+"""
+
+
 def imagej_open_sequence_args(
     measurement: Measurement,
     fov: str,
     start: int,
+    *,
+    exact_use_filter: bool = False,
 ) -> Tuple[Path, str]:
     """Return the source folder and ImageJ options for a flat or xy-subfolder stack."""
     fov_dir = measurement.source_dir / fov
     if fov_dir.is_dir():
         return fov_dir.resolve(), f"start={start}"
-    return measurement.source_dir.resolve(), f"filter={fov} start={start}"
+    frame_filter = f"{fov}use" if exact_use_filter else fov
+    return measurement.source_dir.resolve(), f"filter={frame_filter} start={start}"
 
 
 FRAME_FILE_RE = re.compile(r"use(\d{4})\.tiff?$", re.IGNORECASE)
@@ -638,6 +718,70 @@ def stack_frame_files(stack_dir: Path) -> List[Path]:
         for path in stack_dir.glob("*.tif*")
         if not any(term in path.stem.lower() for term in sidecar_terms)
     )
+
+
+def indexed_stack_frame_files(stack_dir: Path) -> List[Tuple[int, Path]]:
+    """Return ImageJ sequence frames with their useNNNN indices."""
+    indexed: List[Tuple[int, Path]] = []
+    for path in stack_dir.glob("*.tif*"):
+        match = FRAME_FILE_RE.search(path.name)
+        if match:
+            indexed.append((int(match.group(1)), path))
+    return sorted(indexed)
+
+
+def validate_tiff_sequence_frame_count(stack_dir: Path, expected: int, label: str) -> List[Path]:
+    """
+    Require an exact contiguous ImageJ TIFF sequence.
+
+    Sidecar TIFFs such as masks are ignored because they do not match the
+    ImageJ sequence suffix. Fiji's Image Sequence writer can save either
+    zero-based ``use0000..useNNNN`` or one-based ``use0001..useNNNN`` indices,
+    depending on the runtime/plugin path, so both contiguous forms are valid.
+    """
+    if expected <= 0:
+        raise ValueError(f"{label}: expected frame count must be positive, got {expected}.")
+    if not stack_dir.is_dir():
+        raise RuntimeError(f"{label}: missing TIFF sequence directory {stack_dir}.")
+
+    indexed = indexed_stack_frame_files(stack_dir)
+    indices = [idx for idx, _ in indexed]
+    one_based = list(range(1, int(expected) + 1))
+    zero_based = list(range(0, int(expected)))
+    if indices in (one_based, zero_based):
+        return [path for _, path in indexed]
+
+    index_set = set(indices)
+    expected_indices = zero_based if 0 in index_set else one_based
+    expected_label = (
+        f"use0000..use{expected - 1:04d}"
+        if expected_indices == zero_based
+        else f"use0001..use{expected:04d}"
+    )
+    missing = [idx for idx in expected_indices if idx not in index_set]
+    extra = [idx for idx in indices if idx not in set(expected_indices)]
+    duplicates = sorted({idx for idx in indices if indices.count(idx) > 1})
+
+    details = [
+        f"found {len(indexed)} indexed frames",
+        f"expected {expected} contiguous frames ({expected_label})",
+    ]
+    if missing:
+        preview = ", ".join(f"use{idx:04d}" for idx in missing[:10])
+        if len(missing) > 10:
+            preview += ", ..."
+        details.append(f"missing {preview}")
+    if extra:
+        preview = ", ".join(f"use{idx:04d}" for idx in extra[:10])
+        if len(extra) > 10:
+            preview += ", ..."
+        details.append(f"extra {preview}")
+    if duplicates:
+        preview = ", ".join(f"use{idx:04d}" for idx in duplicates[:10])
+        if len(duplicates) > 10:
+            preview += ", ..."
+        details.append(f"duplicate {preview}")
+    raise RuntimeError(f"{label}: invalid TIFF sequence at {stack_dir}: " + "; ".join(details))
 
 
 def has_raw_nd2(input_root: Path) -> bool:
@@ -1417,6 +1561,11 @@ def raw_role_frame_counts(args: argparse.Namespace) -> Dict[str, int]:
     }
 
 
+def expected_raw_sift_frame_count(args: argparse.Namespace) -> int:
+    counts = raw_role_frame_counts(args)
+    return sum(int(counts[role]) for role in ND2_SIFT_ROLE_ORDER)
+
+
 def infer_position_count(role_files: Mapping[str, RawNd2File], args: argparse.Namespace) -> int:
     expected_counts = raw_role_frame_counts(args)
     inferred: List[int] = []
@@ -1516,6 +1665,8 @@ def nd2_ij_pipeline_config(args: argparse.Namespace) -> PipelineConfig:
         multiplex=True,
         full_image=bool(args.full_image),
         full_aligned_root=(args.output_root / "00_aligned_full").resolve(),
+        exact_fov_use_filter=True,
+        expected_sequence_frames=expected_raw_sift_frame_count(args),
     )
 
 
@@ -1718,6 +1869,394 @@ def fovs_per_well_for_measurement(
     if value <= 0:
         raise ValueError("FOVs per well must be positive in raw ND2 mode.")
     return int(value)
+
+
+def build_raw_sift_measurement_plans(
+    args: argparse.Namespace,
+    measurement_dirs: Sequence[Tuple[str, Path]],
+    fov_map: Mapping[str, Mapping[str, str]],
+    measurement_labels: Optional[List[List[object]]],
+) -> List[RawSiftMeasurementPlan]:
+    plans: List[RawSiftMeasurementPlan] = []
+    measurement_count = len(measurement_dirs)
+    safe_names: Dict[str, str] = {}
+    required_roles = ("donor_before", "donor_after", "acceptor_before", "acceptor_after", "laser")
+
+    for measurement_index, (measurement_name, measurement_dir) in enumerate(measurement_dirs):
+        role_files = parse_raw_nd2_files(measurement_dir, args)
+        if not role_files:
+            logging.warning("No usable ND2 files found in %s", measurement_dir)
+            continue
+
+        missing_roles = [role for role in required_roles if role not in role_files]
+        if missing_roles:
+            raise ValueError(
+                f"{measurement_name}: missing ND2 roles for SIFT composite: {', '.join(missing_roles)}. "
+                "Laboratory standard: five files Seq0000..Seq0004 (laser is Seq0002)."
+            )
+        if args.laser_count <= 0:
+            raise ValueError(
+                f"{measurement_name}: raw ND2 SIFT composites require --laser-count >= 1 (laser ND2)."
+            )
+
+        safe_measurement = safe_path_name(measurement_name)
+        if safe_measurement in safe_names:
+            raise ValueError(
+                f"Measurement names {safe_names[safe_measurement]!r} and {measurement_name!r} "
+                f"both map to output folder {safe_measurement!r}. Rename one folder to avoid collisions."
+            )
+        safe_names[safe_measurement] = measurement_name
+
+        position_count = infer_position_count(role_files, args)
+        fovs_per_well = fovs_per_well_for_measurement(
+            args.fovs_per_well_by_measurement,
+            measurement_index,
+            measurement_count,
+            args.fovs_per_well,
+        )
+        labels_for_measurement = select_measurement_spec(
+            measurement_labels,
+            measurement_index,
+            measurement_count,
+            "--measurement-labels-json",
+        )
+
+        fov_disp_list = [fov_label_for_position(i, args, fov_map) for i in range(position_count)]
+        ij_tags = [fov_ij_filter_tag(f) for f in fov_disp_list]
+        if len(set(ij_tags)) != len(ij_tags):
+            raise ValueError(
+                f"{measurement_name}: FOV labels map to duplicate ImageJ tags {ij_tags}. "
+                "Adjust numbering or pass distinct --fov-labels entries."
+            )
+
+        plans.append(
+            RawSiftMeasurementPlan(
+                measurement_index=measurement_index,
+                measurement_count=measurement_count,
+                measurement_name=measurement_name,
+                measurement_dir=measurement_dir,
+                safe_measurement=safe_measurement,
+                role_files=dict(role_files),
+                position_count=position_count,
+                fovs_per_well=fovs_per_well,
+                labels=labels_for_measurement,
+                fov_disp_list=fov_disp_list,
+                ij_tags=ij_tags,
+                cellpose_dir=raw_cellpose_input_dir(args, measurement_name, measurement_dir),
+                cellpose_masks_dir=raw_cellpose_output_dir(args, measurement_name, measurement_dir),
+                full_cellpose_dir=(
+                    raw_full_cellpose_input_dir(args, measurement_name, measurement_dir)
+                    if args.full_image
+                    else None
+                ),
+                full_cellpose_masks_dir=(
+                    raw_full_cellpose_output_dir(args, measurement_name, measurement_dir)
+                    if args.full_image
+                    else None
+                ),
+            )
+        )
+    return plans
+
+
+def materialize_raw_sift_measurement(
+    plan: RawSiftMeasurementPlan,
+    args: argparse.Namespace,
+    scratch_ij: Path,
+) -> Measurement:
+    ij_meas_flat = ensure_dir(scratch_ij / plan.safe_measurement)
+    logging.info(
+        "Materializing ND2 ImageJ source TIFFs for %s (%d FOVs) into %s.",
+        plan.measurement_name,
+        plan.position_count,
+        ij_meas_flat,
+    )
+    for position_index in range(plan.position_count):
+        materialize_nd2_fov_ij_stack(
+            plan.role_files,
+            position_index,
+            ij_meas_flat,
+            plan.ij_tags[position_index],
+            args,
+        )
+    return nd2_ij_measurement(scratch_ij, plan.safe_measurement, plan.ij_tags)
+
+
+def contiguous_chunks(items: Sequence[str], worker_count: int) -> List[List[str]]:
+    if not items:
+        return []
+    chunks_n = min(max(1, int(worker_count)), len(items))
+    base = len(items) // chunks_n
+    remainder = len(items) % chunks_n
+    chunks: List[List[str]] = []
+    start = 0
+    for chunk_index in range(chunks_n):
+        size = base + (1 if chunk_index < remainder else 0)
+        end = start + size
+        chunks.append(list(items[start:end]))
+        start = end
+    return chunks
+
+
+def _register_raw_sift_fov_chunk_worker(
+    measurement: Measurement,
+    config: PipelineConfig,
+    fov_tags: Sequence[str],
+    expected_frames: int,
+    retries: int,
+    log_level: str,
+) -> List[str]:
+    configure_logging(log_level)
+    ij = init_imagej(config.imagej_distribution)
+    completed: List[str] = []
+    for fov_tag in fov_tags:
+        logging.info("Worker registering %s %s", measurement.name, fov_tag)
+        register_and_crop_checked(ij, measurement, config, fov_tag, expected_frames, retries)
+        completed.append(fov_tag)
+    return completed
+
+
+def _register_raw_sift_fov_chunk_process(
+    measurement: Measurement,
+    config: PipelineConfig,
+    fov_tags: Sequence[str],
+    expected_frames: int,
+    retries: int,
+    log_level: str,
+    result_conn,
+) -> None:
+    """
+    Process wrapper for ImageJ registration workers.
+
+    PyImageJ starts JVM threads that can keep a multiprocessing worker alive
+    after the Python task returns. Send the result through a pipe, flush logs,
+    then force-exit this child process so the parent can advance to staging.
+    """
+    try:
+        completed = _register_raw_sift_fov_chunk_worker(
+            measurement,
+            config,
+            fov_tags,
+            expected_frames,
+            retries,
+            log_level,
+        )
+        result_conn.send({"ok": True, "completed": completed, "chunk": list(fov_tags)})
+    except BaseException as exc:  # pragma: no cover - exercised by real worker failures
+        result_conn.send(
+            {
+                "ok": False,
+                "chunk": list(fov_tags),
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+    finally:
+        try:
+            result_conn.close()
+        except Exception:
+            pass
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
+
+
+def register_raw_sift_measurement(
+    *,
+    measurement: Measurement,
+    config: PipelineConfig,
+    fov_tags: Sequence[str],
+    expected_frames: int,
+    retries: int,
+    workers: int,
+    log_level: str,
+    ij: Optional[imagej.ImageJ],
+) -> Optional[imagej.ImageJ]:
+    worker_count = max(1, int(workers))
+    if worker_count == 1:
+        if ij is None:
+            ij = init_imagej(config.imagej_distribution)
+        for fov_tag in fov_tags:
+            register_and_crop_checked(ij, measurement, config, fov_tag, expected_frames, retries)
+        return ij
+
+    chunks = contiguous_chunks(list(fov_tags), worker_count)
+    logging.info(
+        "Registering %s with %d ImageJ worker processes over %d FOVs.",
+        measurement.name,
+        len(chunks),
+        len(fov_tags),
+    )
+    mp_context = multiprocessing.get_context("spawn")
+    workers_state = []
+    for chunk in chunks:
+        parent_conn, child_conn = mp_context.Pipe(duplex=False)
+        process = mp_context.Process(
+            target=_register_raw_sift_fov_chunk_process,
+            args=(
+                measurement,
+                config,
+                chunk,
+                expected_frames,
+                retries,
+                log_level,
+                child_conn,
+            ),
+            name=f"kd-fret-register-{measurement.name}-{chunk[0]}-{chunk[-1]}",
+        )
+        process.start()
+        child_conn.close()
+        workers_state.append((process, parent_conn, chunk))
+
+    pending = {conn: (process, chunk) for process, conn, chunk in workers_state}
+    failures: List[str] = []
+    while pending:
+        ready = wait_multiprocessing_connections(list(pending.keys()), timeout=30)
+        if not ready:
+            alive_chunks = [
+                f"{chunk[0]}-{chunk[-1]}(pid={process.pid})"
+                for process, chunk in pending.values()
+                if process.is_alive()
+            ]
+            logging.info(
+                "Waiting for registration chunks for %s: %s",
+                measurement.name,
+                ", ".join(alive_chunks) if alive_chunks else "worker result pipes",
+            )
+            continue
+        for conn in ready:
+            process, chunk = pending.pop(conn)
+            try:
+                message = conn.recv()
+            except EOFError:
+                message = {
+                    "ok": False,
+                    "chunk": list(chunk),
+                    "error": f"worker exited without sending a result (exitcode={process.exitcode})",
+                    "traceback": "",
+                }
+            finally:
+                conn.close()
+
+            process.join(timeout=10)
+            if process.is_alive():
+                logging.warning(
+                    "Registration worker pid %s for %s %s-%s did not exit after reporting; terminating.",
+                    process.pid,
+                    measurement.name,
+                    chunk[0],
+                    chunk[-1],
+                )
+                process.terminate()
+                process.join(timeout=10)
+                if process.is_alive() and hasattr(process, "kill"):
+                    process.kill()
+                    process.join(timeout=5)
+
+            if message.get("ok"):
+                completed = message.get("completed") or list(chunk)
+                logging.info(
+                    "Finished registration chunk for %s: %s",
+                    measurement.name,
+                    ", ".join(completed),
+                )
+            else:
+                failures.append(
+                    f"{measurement.name} {chunk[0]}-{chunk[-1]}: {message.get('error')}\n"
+                    f"{message.get('traceback', '')}"
+                )
+
+    for process, _conn, chunk in workers_state:
+        if process.is_alive():
+            logging.warning(
+                "Registration worker pid %s for %s %s-%s still alive after chunk collection; terminating.",
+                process.pid,
+                measurement.name,
+                chunk[0],
+                chunk[-1],
+            )
+            process.terminate()
+            process.join(timeout=10)
+
+    if failures:
+        raise RuntimeError("Parallel registration failed:\n" + "\n".join(failures))
+    return ij
+
+
+def stage_raw_sift_measurement_jobs(
+    plan: RawSiftMeasurementPlan,
+    measurement: Measurement,
+    config: PipelineConfig,
+    args: argparse.Namespace,
+    fov_map: Mapping[str, Mapping[str, str]],
+) -> List[RawFovJob]:
+    jobs: List[RawFovJob] = []
+    for position_index in range(plan.position_count):
+        fov_disp = plan.fov_disp_list[position_index]
+        fov_tag = plan.ij_tags[position_index]
+        registered_dir = (config.registered_root / measurement.name / fov_tag).resolve()
+        full_stack_dir = None
+        full_frame_path = None
+        full_mask_path = None
+        crop_metadata_path = None
+        if args.full_image:
+            if config.full_aligned_root is None or plan.full_cellpose_dir is None or plan.full_cellpose_masks_dir is None:
+                raise RuntimeError(f"{plan.measurement_name}: --full-image paths were not initialized.")
+            full_stack_dir = (config.full_aligned_root / measurement.name / fov_tag).resolve()
+            crop_metadata_path = registered_dir / "crop_metadata.json"
+            if not registered_stack_available(full_stack_dir):
+                raise RuntimeError(
+                    f"{plan.measurement_name} {fov_disp}: --full-image registration did not save full aligned stack "
+                    f"at {full_stack_dir}."
+                )
+            if not crop_metadata_path.exists():
+                raise RuntimeError(
+                    f"{plan.measurement_name} {fov_disp}: --full-image registration did not save crop metadata "
+                    f"at {crop_metadata_path}."
+                )
+            full_frame_path = plan.full_cellpose_dir / f"{safe_path_name(fov_disp)}_donor_pre_frame{args.cellpose_frame_index:04d}.tif"
+            full_mask_path = plan.full_cellpose_masks_dir / f"{full_frame_path.stem}_cp_masks.tif"
+
+        well_index, well, iptg_label, condition = metadata_for_measurement_position(
+            fov=fov_disp,
+            position_number=position_index + 1,
+            position_count=plan.position_count,
+            fov_map=fov_map,
+            fovs_per_well=plan.fovs_per_well,
+            labels=plan.labels,
+        )
+        frame_path = plan.cellpose_dir / f"{safe_path_name(fov_disp)}_donor_pre_frame{args.cellpose_frame_index:04d}.tif"
+        mask_path = plan.cellpose_masks_dir / f"{frame_path.stem}_cp_masks.tif"
+        if args.full_image:
+            write_full_registered_donor_cellpose_frame(full_stack_dir, full_frame_path, args)
+        else:
+            write_registered_donor_cellpose_frame(registered_dir, frame_path, args)
+
+        jobs.append(
+            RawFovJob(
+                measurement_name=plan.measurement_name,
+                measurement_dir=plan.measurement_dir,
+                position_index=position_index,
+                fov=fov_disp,
+                well_index=well_index,
+                well=well,
+                iptg_label=iptg_label,
+                condition=condition,
+                role_files=dict(plan.role_files),
+                cellpose_frame_path=frame_path,
+                cellpose_mask_path=mask_path,
+                crop_rect=None,
+                registered_stack_dir=registered_dir,
+                full_stack_dir=full_stack_dir,
+                full_cellpose_frame_path=full_frame_path,
+                full_cellpose_mask_path=full_mask_path,
+                crop_metadata_path=crop_metadata_path,
+            )
+        )
+    return jobs
 
 
 def build_raw_jobs(args: argparse.Namespace) -> List[RawFovJob]:
@@ -1976,12 +2515,21 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
         )
     if args.skip_registration:
         return build_raw_jobs_sift_restart(args)
+    if int(args.nd2_sift_registration_retries) < 0:
+        raise ValueError("--nd2-sift-registration-retries must be >= 0.")
+    if int(args.nd2_sift_registration_workers) < 1:
+        raise ValueError("--nd2-sift-registration-workers must be >= 1.")
 
     scratch_ij = ensure_dir(args.output_root / "nd2_ij_source")
     fov_map = load_fov_map(args.fov_map)
     measurement_dirs = discover_raw_measurement_dirs(args.input_root)
     measurement_labels = load_nested_cli_list(args.measurement_labels_json, "--measurement-labels-json")
+    plans = build_raw_sift_measurement_plans(args, measurement_dirs, fov_map, measurement_labels)
     jobs: List[RawFovJob] = []
+    expected_frames = expected_raw_sift_frame_count(args)
+
+    if not plans:
+        raise RuntimeError("No raw ND2 FOV jobs were prepared (SIFT path).")
 
     ensure_dir(args.output_root / "01_registered")
     ensure_dir(args.output_root / "01_registered_bleached")
@@ -1996,48 +2544,12 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
     else:
         roi_sample_dir = args.output_root / "nd2_ij_roi_temp"
         sample_found = False
-        for measurement_index, (measurement_name, measurement_dir) in enumerate(measurement_dirs):
-            role_files = parse_raw_nd2_files(measurement_dir, args)
-            if not role_files:
-                continue
-            safe_measurement = safe_path_name(measurement_name)
-            missing_roles = [
-                role
-                for role in ("donor_before", "donor_after", "acceptor_before", "acceptor_after", "laser")
-                if role not in role_files
-            ]
-            if missing_roles:
-                raise ValueError(
-                    f"{measurement_name}: missing ND2 roles for SIFT composite: {', '.join(missing_roles)}. "
-                    "Laboratory standard: five files Seq0000..Seq0004 (laser is Seq0002)."
-                )
-            if args.laser_count <= 0:
-                raise ValueError(
-                    f"{measurement_name}: raw ND2 SIFT composites require --laser-count >= 1 (laser ND2)."
-                )
-            position_count = infer_position_count(role_files, args)
-            fov_disp_list = [fov_label_for_position(i, args, fov_map) for i in range(position_count)]
-            ij_tags = [fov_ij_filter_tag(f) for f in fov_disp_list]
-            if len(set(ij_tags)) != len(ij_tags):
-                raise ValueError(
-                    f"{measurement_name}: FOV labels map to duplicate ImageJ tags {ij_tags}. "
-                    "Adjust numbering or pass distinct --fov-labels entries."
-                )
-
+        for plan in plans:
             if ij is None:
                 ij = init_imagej(args.imagej_distribution)
 
             try:
-                ij_meas_flat = ensure_dir(scratch_ij / safe_measurement)
-                for position_index in range(position_count):
-                    materialize_nd2_fov_ij_stack(
-                        role_files,
-                        position_index,
-                        ij_meas_flat,
-                        ij_tags[position_index],
-                        args,
-                    )
-                measurement = nd2_ij_measurement(scratch_ij, safe_measurement, ij_tags)
+                measurement = materialize_raw_sift_measurement(plan, args, scratch_ij)
                 first_tag = measurement.fovs[0]
                 align_stack_only(
                     ij=ij,
@@ -2045,6 +2557,11 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
                     config=seed_cfg,
                     fov=first_tag,
                     dest_dir=roi_sample_dir,
+                )
+                validate_tiff_sequence_frame_count(
+                    roi_sample_dir,
+                    expected_frames,
+                    f"{plan.measurement_name} {first_tag} ROI sample aligned stack",
                 )
                 prompt_for_laser_roi_from_stack(
                     ij,
@@ -2058,7 +2575,7 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
             except RuntimeError as exc:
                 logging.warning(
                     "Skipping %s for global laser ROI setup: %s",
-                    measurement_name,
+                    plan.measurement_name,
                     exc,
                 )
             finally:
@@ -2072,142 +2589,67 @@ def build_raw_jobs_sift(args: argparse.Namespace) -> List[RawFovJob]:
             )
         logging.info("Saved global laser ROI for all measurements to %s", shared_laser_roi_path)
 
-    for measurement_index, (measurement_name, measurement_dir) in enumerate(measurement_dirs):
-        role_files = parse_raw_nd2_files(measurement_dir, args)
-        if not role_files:
-            logging.warning("No usable ND2 files found in %s", measurement_dir)
-            continue
-
-        if ij is None:
-            ij = init_imagej(args.imagej_distribution)
-        safe_measurement = safe_path_name(measurement_name)
-        cellpose_dir = raw_cellpose_input_dir(args, measurement_name, measurement_dir)
-        cellpose_masks_dir = raw_cellpose_output_dir(args, measurement_name, measurement_dir)
-        full_cellpose_dir = raw_full_cellpose_input_dir(args, measurement_name, measurement_dir) if args.full_image else None
-        full_cellpose_masks_dir = raw_full_cellpose_output_dir(args, measurement_name, measurement_dir) if args.full_image else None
-        missing_roles = [
-            role
-            for role in ("donor_before", "donor_after", "acceptor_before", "acceptor_after", "laser")
-            if role not in role_files
-        ]
-        if missing_roles:
-            raise ValueError(
-                f"{measurement_name}: missing ND2 roles for SIFT composite: {', '.join(missing_roles)}. "
-                "Laboratory standard: five files Seq0000..Seq0004 (laser is Seq0002)."
-            )
-        if args.laser_count <= 0:
-            raise ValueError(
-                f"{measurement_name}: raw ND2 SIFT composites require --laser-count >= 1 (laser ND2)."
-            )
-
-        position_count = infer_position_count(role_files, args)
-        fovs_per_well = fovs_per_well_for_measurement(
-            args.fovs_per_well_by_measurement,
-            measurement_index,
-            len(measurement_dirs),
-            args.fovs_per_well,
-        )
-        labels_for_measurement = select_measurement_spec(
-            measurement_labels,
-            measurement_index,
-            len(measurement_dirs),
-            "--measurement-labels-json",
-        )
-
-        ij_meas_flat = ensure_dir(scratch_ij / safe_measurement)
-        fov_disp_list = [fov_label_for_position(i, args, fov_map) for i in range(position_count)]
-        ij_tags = [fov_ij_filter_tag(f) for f in fov_disp_list]
-        if len(set(ij_tags)) != len(ij_tags):
-            raise ValueError(
-                f"{measurement_name}: FOV labels map to duplicate ImageJ tags {ij_tags}. "
-                "Adjust numbering or pass distinct --fov-labels entries."
-            )
-
-        for position_index in range(position_count):
-            materialize_nd2_fov_ij_stack(
-                role_files,
-                position_index,
-                ij_meas_flat,
-                ij_tags[position_index],
-                args,
-            )
-
-        measurement = nd2_ij_measurement(scratch_ij, safe_measurement, ij_tags)
+    def finish_materialized_measurement(
+        plan: RawSiftMeasurementPlan,
+        measurement: Measurement,
+        current_ij: Optional[imagej.ImageJ],
+    ) -> Optional[imagej.ImageJ]:
         ij_cfg = nd2_ij_pipeline_config(args)
         ij_cfg.laser_roi_path = shared_laser_roi_path
+        current_ij = register_raw_sift_measurement(
+            measurement=measurement,
+            config=ij_cfg,
+            fov_tags=measurement.fovs,
+            expected_frames=expected_frames,
+            retries=int(args.nd2_sift_registration_retries),
+            workers=int(args.nd2_sift_registration_workers),
+            log_level=args.log_level,
+            ij=current_ij,
+        )
+        jobs.extend(stage_raw_sift_measurement_jobs(plan, measurement, ij_cfg, args, fov_map))
 
-        for fov_tag in measurement.fovs:
-            register_and_crop(ij, measurement, ij_cfg, fov_tag)
+        if not args.keep_nd2_ij_source:
+            ij_meas_flat = scratch_ij / plan.safe_measurement
+            shutil.rmtree(ij_meas_flat, ignore_errors=True)
+            logging.info("Deleted temporary ND2 ImageJ source TIFFs for %s at %s.", plan.measurement_name, ij_meas_flat)
+        return current_ij
 
-        for position_index in range(position_count):
-            fov_disp = fov_disp_list[position_index]
-            fov_tag = ij_tags[position_index]
-            registered_dir = (ij_cfg.registered_root / measurement.name / fov_tag).resolve()
-            full_stack_dir = None
-            full_frame_path = None
-            full_mask_path = None
-            crop_metadata_path = None
-            if args.full_image:
-                full_stack_dir = (ij_cfg.full_aligned_root / measurement.name / fov_tag).resolve()
-                crop_metadata_path = registered_dir / "crop_metadata.json"
-                if not registered_stack_available(full_stack_dir):
-                    raise RuntimeError(
-                        f"{measurement_name} {fov_disp}: --full-image registration did not save full aligned stack "
-                        f"at {full_stack_dir}."
-                    )
-                if not crop_metadata_path.exists():
-                    raise RuntimeError(
-                        f"{measurement_name} {fov_disp}: --full-image registration did not save crop metadata "
-                        f"at {crop_metadata_path}."
-                    )
-                full_frame_path = full_cellpose_dir / f"{safe_path_name(fov_disp)}_donor_pre_frame{args.cellpose_frame_index:04d}.tif"
-                full_mask_path = full_cellpose_masks_dir / f"{full_frame_path.stem}_cp_masks.tif"
-            well_index, well, iptg_label, condition = metadata_for_measurement_position(
-                fov=fov_disp,
-                position_number=position_index + 1,
-                position_count=position_count,
-                fov_map=fov_map,
-                fovs_per_well=fovs_per_well,
-                labels=labels_for_measurement,
+    if args.nd2_sift_prefetch_measurements and len(plans) > 1:
+        logging.info("ND2 SIFT prefetch enabled: staging one measurement ahead.")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            current_measurement = materialize_raw_sift_measurement(plans[0], args, scratch_ij)
+            next_future: Optional[concurrent.futures.Future[Measurement]] = executor.submit(
+                materialize_raw_sift_measurement,
+                plans[1],
+                args,
+                scratch_ij,
             )
-            frame_path = cellpose_dir / f"{safe_path_name(fov_disp)}_donor_pre_frame{args.cellpose_frame_index:04d}.tif"
-            mask_path = cellpose_masks_dir / f"{frame_path.stem}_cp_masks.tif"
-            if args.full_image:
-                write_full_registered_donor_cellpose_frame(full_stack_dir, full_frame_path, args)
-            else:
-                write_registered_donor_cellpose_frame(registered_dir, frame_path, args)
-
-            job = RawFovJob(
-                measurement_name=measurement_name,
-                measurement_dir=measurement_dir,
-                position_index=position_index,
-                fov=fov_disp,
-                well_index=well_index,
-                well=well,
-                iptg_label=iptg_label,
-                condition=condition,
-                role_files=role_files,
-                cellpose_frame_path=frame_path,
-                cellpose_mask_path=mask_path,
-                crop_rect=None,
-                registered_stack_dir=registered_dir,
-                full_stack_dir=full_stack_dir,
-                full_cellpose_frame_path=full_frame_path,
-                full_cellpose_mask_path=full_mask_path,
-                crop_metadata_path=crop_metadata_path,
-            )
-            jobs.append(job)
+            for plan_index, plan in enumerate(plans):
+                ij = finish_materialized_measurement(plan, current_measurement, ij)
+                if plan_index + 1 < len(plans):
+                    if next_future is None:
+                        raise RuntimeError("Internal error: missing prefetched measurement future.")
+                    current_measurement = next_future.result()
+                    next_future = (
+                        executor.submit(
+                            materialize_raw_sift_measurement,
+                            plans[plan_index + 2],
+                            args,
+                            scratch_ij,
+                        )
+                        if plan_index + 2 < len(plans)
+                        else None
+                    )
+    else:
+        for plan in plans:
+            measurement = materialize_raw_sift_measurement(plan, args, scratch_ij)
+            ij = finish_materialized_measurement(plan, measurement, ij)
 
     if not jobs:
         raise RuntimeError("No raw ND2 FOV jobs were prepared (SIFT path).")
 
-    if ij is None:  # pragma: no cover - defensive; loop would yield jobs otherwise
-        raise RuntimeError(
-            "SIFT multiplex path yielded no Fiji work (no ND2 measurements with five Seq roles?)."
-        )
-
     logging.info(
-        "ND2 SIFT multiplex: virtual TIFF multiplex under %s; registered cropped stacks under %s.",
+        "ND2 SIFT multiplex: temporary virtual TIFF multiplex root %s; registered cropped stacks under %s.",
         scratch_ij,
         args.output_root / "01_registered",
     )
@@ -3205,11 +3647,18 @@ def align_stack_only(
         fov,
         dest_dir,
     )
-    src_dir, open_options = imagej_open_sequence_args(measurement, fov, config.sequence_start)
+    src_dir, open_options = imagej_open_sequence_args(
+        measurement,
+        fov,
+        config.sequence_start,
+        exact_use_filter=config.exact_fov_use_filter,
+    )
+    slice_check_macro = imagej_expected_slices_macro(config, f"{measurement.name} {fov}")
     macro = f"""
 run("Close All");
 src = "{path_for_macro(src_dir)}";
 File.openSequence(src, "{open_options}");
+{slice_check_macro}
 run("Enhance Contrast", "saturated=0.35");
 print("Loaded stack has " + nSlices + " slices, starting SIFT alignment...");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
@@ -3333,11 +3782,18 @@ metadata = "{{\\n" +
 File.saveString(metadata, "{path_for_macro(crop_metadata_path)}");
 print("Saved crop metadata to {path_for_macro(crop_metadata_path)}");
 """
-    src_dir, open_options = imagej_open_sequence_args(measurement, fov, config.sequence_start)
+    src_dir, open_options = imagej_open_sequence_args(
+        measurement,
+        fov,
+        config.sequence_start,
+        exact_use_filter=config.exact_fov_use_filter,
+    )
+    slice_check_macro = imagej_expected_slices_macro(config, f"{measurement.name} {fov}")
     macro = f"""
 run("Close All");
 src = "{path_for_macro(src_dir)}";
 File.openSequence(src, "{open_options}");
+{slice_check_macro}
 run("Enhance Contrast", "saturated=0.35");
 print("Loaded stack has " + nSlices + " slices, starting SIFT alignment...");
 run("Linear Stack Alignment with SIFT", "{SIFT_PARAMS}");
@@ -3439,6 +3895,98 @@ run("Close All");
     return dest_dir
 
 
+def validate_raw_sift_registration_outputs(
+    measurement: Measurement,
+    config: PipelineConfig,
+    fov: str,
+    expected_frames: int,
+) -> None:
+    """Validate all raw SIFT registration outputs needed downstream."""
+    registered_dir = config.registered_root / measurement.name / fov
+    bleached_dir = config.registered_bleached_root / measurement.name / fov
+    unbleached_dir = config.registered_unbleached_root / measurement.name / fov
+    validate_tiff_sequence_frame_count(
+        registered_dir,
+        expected_frames,
+        f"{measurement.name} {fov} registered crop",
+    )
+    validate_tiff_sequence_frame_count(
+        bleached_dir,
+        expected_frames,
+        f"{measurement.name} {fov} bleached-only crop",
+    )
+    validate_tiff_sequence_frame_count(
+        unbleached_dir,
+        expected_frames,
+        f"{measurement.name} {fov} unbleached-only crop",
+    )
+
+    required_sidecars = [
+        registered_dir / "bleach_roi_mask.tif",
+        registered_dir / "bleach_roi_crop.roi",
+    ]
+    if getattr(config, "full_image", False):
+        if config.full_aligned_root is None:
+            raise RuntimeError(
+                f"{measurement.name} {fov}: full-image validation requested without full_aligned_root."
+            )
+        full_dir = config.full_aligned_root / measurement.name / fov
+        validate_tiff_sequence_frame_count(
+            full_dir,
+            expected_frames,
+            f"{measurement.name} {fov} full aligned stack",
+        )
+        required_sidecars.append(registered_dir / "crop_metadata.json")
+
+    missing = [path for path in required_sidecars if not path.exists()]
+    if missing:
+        raise RuntimeError(
+            f"{measurement.name} {fov}: missing required registration sidecars: "
+            + ", ".join(str(path) for path in missing)
+        )
+
+
+def register_and_crop_checked(
+    ij: imagej.ImageJ,
+    measurement: Measurement,
+    config: PipelineConfig,
+    fov: str,
+    expected_frames: int,
+    retries: int,
+) -> Path:
+    """Run ImageJ registration for one FOV and retry if output validation fails."""
+    total_attempts = max(1, int(retries) + 1)
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, total_attempts + 1):
+        try:
+            dest_dir = register_and_crop(ij, measurement, config, fov)
+            validate_raw_sift_registration_outputs(measurement, config, fov, expected_frames)
+            if attempt > 1:
+                logging.info(
+                    "Registration recovered for %s %s on attempt %d/%d.",
+                    measurement.name,
+                    fov,
+                    attempt,
+                    total_attempts,
+                )
+            return dest_dir
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= total_attempts:
+                break
+            logging.warning(
+                "Registration validation failed for %s %s on attempt %d/%d: %s. Retrying.",
+                measurement.name,
+                fov,
+                attempt,
+                total_attempts,
+                exc,
+            )
+    raise RuntimeError(
+        f"Registration failed for {measurement.name} {fov} after {total_attempts} attempt(s): {last_exc}"
+    ) from last_exc
+
+
 # --------------------------------------------------------------------------------------
 # Cellpose helpers
 # --------------------------------------------------------------------------------------
@@ -3476,6 +4024,8 @@ def run_cellpose_cli(
     use_gpu: bool = False,
 ) -> None:
     cmd = [
+        sys.executable,
+        "-m",
         "cellpose",
         "--dir",
         str(cellpose_input),

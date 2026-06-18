@@ -72,7 +72,7 @@ donor-after frames, and 2 acceptor-after frames per FOV.
 | `Seq0003` | `donor_after` | 18 | `DonAB`, first 3 frames |
 | `Seq0004` | `acceptor_after` / mCherry after bleach | 2 | ROI prompt image; `AccAB`, first 2 frames |
 
-With `--nd2-alignment sift` (default), the script writes a flat virtual TIFF
+With `--nd2-alignment sift` (default), the script writes a temporary flat virtual TIFF
 multiplex under `<output-root>/nd2_ij_source/` in legacy TIFF order:
 donor-before, donor-after, acceptor-before, acceptor-after. The laser-only
 frames are not included in this SIFT/quantification stack. Fiji linear stack
@@ -80,9 +80,21 @@ alignment (SIFT) then runs on that stack, the script prompts for one global
 laser ROI on an aligned post-bleach mCherry image, and cropped aligned stacks
 are written under `01_registered/`. Cellpose receives the fifth donor
 pre-bleach frame from the cropped aligned stack, matching the legacy TIFF
-workflow. Pass `--laser-roi` to skip the prompt and reuse a saved ROI. Use
+workflow. The temporary per-measurement `nd2_ij_source/` TIFFs are deleted
+after registration and Cellpose frame staging by default; pass
+`--keep-nd2-ij-source` only when you need to inspect those staging files. Pass
+`--laser-roi` to skip the prompt and reuse a saved ROI. Use
 `--nd2-alignment none` only as a non-SIFT fallback; in that mode `--roi-mode`
 controls prompt-ring, prompt-two, or auto-laser ROI handling.
+
+Raw SIFT registration validates every saved FOV immediately: the registered,
+bleached-only, unbleached-only, and full-image stacks (when enabled) must have
+the expected contiguous `use0001..useNNNN` frame sequence. Failed FOVs are
+retried once by default (`--nd2-sift-registration-retries 1`). To experiment
+with faster registration, keep the default one-worker behavior for baseline
+runs, then add `--nd2-sift-registration-workers 2` and optionally
+`--nd2-sift-prefetch-measurements` to stage the next measurement while the
+current one registers.
 
 To restart from saved aligned/cropped stacks, keep the same input/output roots
 and add `--skip-registration`. The raw SIFT restart path reuses
@@ -128,8 +140,8 @@ Workflow summary:
 2. If no ROI is supplied, it aligns one stack, shows the post-bleach mCherry
    frame in ImageJ, and waits for you to draw the laser ROI (oval tool selected
    by default, brightness/contrast dialog open).
-3. Registers and crops every stack, pauses 10 seconds between measurements (to
-   mimic Plugin 1), prepares Cellpose frames, and optionally runs Cellpose.
+3. Registers and crops every stack, validates the saved frame sequences,
+   prepares Cellpose frames, and optionally runs Cellpose.
 4. Loads each registered stack plus the mirrored `03_cellpose_raw_output/` mask,
    applies the ROI quality filter, computes Don/Acc metrics, FRET, CorrFRET,
    ratio, etc.
@@ -156,6 +168,10 @@ Workflow summary:
 | `--roi-mode prompt-ring\|prompt-two\|auto-laser` | Only used with `--nd2-alignment none`. |
 | `--skip-registration` | Reuse existing registered stacks; raw SIFT expects `01_registered/<measurement>/xyNN/`. |
 | `--full-image` | Raw ND2 SIFT only: save full aligned stacks, run full-FOV Cellpose, derive cropped masks, and use global lowest full-image backgrounds. |
+| `--keep-nd2-ij-source` | Keep temporary raw ND2 ImageJ source TIFFs under `nd2_ij_source/`; by default these are deleted per measurement after registration. |
+| `--nd2-sift-registration-retries INT` | Raw ND2 SIFT only: retry a FOV this many extra times if registered stack validation fails (default 1). |
+| `--nd2-sift-registration-workers INT` | Raw ND2 SIFT only: split FOV registration within a measurement across this many ImageJ worker processes (default 1). |
+| `--nd2-sift-prefetch-measurements` | Raw ND2 SIFT only: materialize the next measurement's temporary TIFFs while the current measurement registers. |
 | `--imagej-distribution STR` | Pass custom ImageJ/Fiji distribution string to `imagej.init()`. |
 | `--sequence-start INT` | Legacy TIFF start index passed to `File.openSequence` (default 5). |
 | `--nd2-align-frame-start INT` | Raw ND2 SIFT start index; keep the default `1`. |

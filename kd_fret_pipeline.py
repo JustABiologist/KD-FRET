@@ -562,6 +562,8 @@ def run_cellpose_cli(
     channels: Tuple[int, int],
 ) -> None:
     cmd = [
+        sys.executable,
+        "-m",
         "cellpose",
         "--dir",
         str(cellpose_input),
